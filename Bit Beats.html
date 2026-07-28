@@ -53,8 +53,9 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 /* ===== TRACK OVERVIEW (GarageBand-like arrange area) ===== */
 #arrange{
   display:flex; background:var(--bg1); border-bottom:1px solid var(--line);
-  height:150px; flex-shrink:0;
+  height:180px; flex-shrink:0;
 }
+#rollDivider{ height:8px; background:var(--bg1); border-bottom:1px solid var(--line); flex-shrink:0; }
 #trackListCol{
   width:230px; flex-shrink:0; border-right:1px solid var(--line); overflow-y:auto; background:var(--bg2);
 }
@@ -79,7 +80,7 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 #timelineCol{flex:1; overflow:auto; position:relative;}
 #timelineInner{position:relative;}
 #arrangeRuler{
-  position:sticky; top:0; height:18px; z-index:4; background:var(--bg1); border-bottom:1px solid var(--line);
+  position:sticky; top:12px; height:18px; z-index:4; background:var(--bg1); border-bottom:1px solid var(--line);
 }
 .timelineRow{
   height:46px; border-bottom:1px solid var(--line); position:relative; background-image:
@@ -91,6 +92,7 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
   border:1px solid rgba(0,0,0,.35); cursor:grab;
 }
 .overviewBlock.dragging{cursor:grabbing; opacity:1; box-shadow:0 0 0 2px #fff;}
+.overviewBlock.regionSelected{outline:2px solid #fff; opacity:1; z-index:2;}
 #playheadOverview{position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none;}
 /* the flag is a separate element (see #playheadOverviewFlag) kept pinned to the visible scroll
    position via JS, rather than a pseudo-element anchored to the (possibly scrolled-away) top of #playheadOverview */
@@ -102,10 +104,18 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 
 /* ===== INSTRUMENT EDITOR ===== */
 #instEditor{
-  display:flex; align-items:center; gap:18px; padding:8px 14px; background:var(--bg1);
-  border-bottom:1px solid var(--line); flex-wrap:wrap; row-gap:8px; flex-shrink:0;
+  width:460px; flex-shrink:0; display:flex; flex-direction:column; justify-content:flex-start; gap:5px;
+  padding:8px 14px; background:var(--bg1); border-left:1px solid var(--line); overflow:hidden;
 }
-.slidergroup{display:flex; flex-direction:column; gap:2px; width:90px;}
+.instTopRow{display:flex; align-items:flex-end; gap:10px;}
+.instTopRow .field{flex-shrink:0;}
+#instTrackName{
+  color:var(--text); font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; max-width:110px; display:inline-block;
+}
+.instSliders{display:grid; grid-template-columns:repeat(3,1fr); gap:2px 12px;}
+.instFooter{display:flex; align-items:flex-end; gap:10px; justify-content:space-between;}
+.slidergroup{display:flex; flex-direction:column; gap:2px;}
 .slidergroup .val{font-size:10px; color:var(--text-dim);}
 
 /* ===== PIANO ROLL ===== */
@@ -130,6 +140,14 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
   box-shadow:0 1px 2px rgba(0,0,0,.4);
 }
 .note.selected{outline:2px solid #fff; z-index:3;}
+.note.bend{border-style:dashed;}
+.bendHandle{position:absolute; right:-3px; top:0; width:7px; height:100%; cursor:crosshair; z-index:4;}
+.note:hover .bendHandle{background:rgba(255,255,255,.3); border-radius:2px;}
+.bendLabel{
+  position:absolute; left:100%; top:0; height:100%; margin-left:5px; display:flex; align-items:center;
+  font-size:9px; font-weight:600; color:#fff; white-space:nowrap; pointer-events:none; z-index:5;
+  text-shadow:0 1px 2px rgba(0,0,0,.9), 0 0 3px rgba(0,0,0,.7);
+}
 #selectionBox{
   position:absolute; border:1px solid var(--accent2); background:rgba(111,168,255,.15); z-index:4; pointer-events:none; display:none;
 }
@@ -252,46 +270,54 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
       <div id="playheadOverview"></div>
     </div>
   </div>
-</div>
 
-<!-- ================= INSTRUMENT EDITOR ================= -->
-<div id="instEditor">
-  <label class="field">Track<span id="instTrackName" style="color:var(--text); font-size:12px; font-weight:600;">—</span></label>
-  <label class="field">Waveform
-    <select id="waveSel">
-      <option value="square">Square (8-bit)</option>
-      <option value="pulse25">Pulse 25%</option>
-      <option value="pulse12">Pulse 12.5%</option>
-      <option value="triangle">Triangle</option>
-      <option value="sawtooth">Sawtooth</option>
-      <option value="sine">Sine</option>
-      <option value="noise">Noise (Drum)</option>
-      <option value="custom">Custom Sample</option>
-    </select>
-  </label>
-  <button id="uploadSampleBtn" class="small">Upload Sample&hellip;</button>
-  <span id="sampleName" style="font-size:10px; color:var(--text-dim); max-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+  <!-- ================= INSTRUMENT EDITOR ================= -->
+  <div id="instEditor">
+    <div class="instTopRow">
+      <label class="field">Track<span id="instTrackName">—</span></label>
+      <label class="field">Waveform
+        <select id="waveSel">
+          <option value="square">Square (8-bit)</option>
+          <option value="pulse25">Pulse 25%</option>
+          <option value="pulse12">Pulse 12.5%</option>
+          <option value="triangle">Triangle</option>
+          <option value="sawtooth">Sawtooth</option>
+          <option value="sine">Sine</option>
+          <option value="noise">Noise (Drum)</option>
+          <option value="custom">Custom Sample</option>
+        </select>
+      </label>
+      <button id="uploadSampleBtn" class="small">Upload Sample&hellip;</button>
+      <span id="sampleName" style="font-size:10px; color:var(--text-dim); max-width:90px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+    </div>
 
-  <div class="slidergroup"><span>Volume <span class="val" id="volVal">80</span></span>
-    <input type="range" id="volSlider" min="0" max="100" value="80"></div>
-  <div class="slidergroup"><span>Attack <span class="val" id="atkVal">5ms</span></span>
-    <input type="range" id="atkSlider" min="0" max="300" value="5"></div>
-  <div class="slidergroup"><span>Release <span class="val" id="relVal">80ms</span></span>
-    <input type="range" id="relSlider" min="5" max="800" value="80"></div>
-  <div class="slidergroup"><span>EQ Low <span class="val" id="eqLowVal">0dB</span></span>
-    <input type="range" id="eqLowSlider" min="-24" max="24" value="0"></div>
-  <div class="slidergroup"><span>EQ Mid <span class="val" id="eqMidVal">0dB</span></span>
-    <input type="range" id="eqMidSlider" min="-24" max="24" value="0"></div>
-  <div class="slidergroup"><span>EQ High <span class="val" id="eqHighVal">0dB</span></span>
-    <input type="range" id="eqHighSlider" min="-24" max="24" value="0"></div>
-  <div class="slidergroup"><span>Reverb <span class="val" id="revVal">0%</span></span>
-    <input type="range" id="revSlider" min="0" max="100" value="0"></div>
+    <div class="instSliders">
+      <div class="slidergroup"><span>Volume <span class="val" id="volVal">80</span></span>
+        <input type="range" id="volSlider" min="0" max="100" value="80"></div>
+      <div class="slidergroup"><span>Attack <span class="val" id="atkVal">5ms</span></span>
+        <input type="range" id="atkSlider" min="0" max="300" value="5"></div>
+      <div class="slidergroup"><span>Release <span class="val" id="relVal">80ms</span></span>
+        <input type="range" id="relSlider" min="5" max="800" value="80"></div>
+      <div class="slidergroup"><span>EQ Low <span class="val" id="eqLowVal">0dB</span></span>
+        <input type="range" id="eqLowSlider" min="-24" max="24" value="0"></div>
+      <div class="slidergroup"><span>EQ Mid <span class="val" id="eqMidVal">0dB</span></span>
+        <input type="range" id="eqMidSlider" min="-24" max="24" value="0"></div>
+      <div class="slidergroup"><span>EQ High <span class="val" id="eqHighVal">0dB</span></span>
+        <input type="range" id="eqHighSlider" min="-24" max="24" value="0"></div>
+    </div>
 
-  <div class="hgroup">
-    <button id="transUpBtn" title="Transpose whole track up 1 semitone">Track &#9650; Semi</button>
-    <button id="transDownBtn" title="Transpose whole track down 1 semitone">Track &#9660; Semi</button>
+    <div class="instFooter">
+      <div class="slidergroup"><span>Reverb <span class="val" id="revVal">0%</span></span>
+        <input type="range" id="revSlider" min="0" max="100" value="0"></div>
+      <div class="hgroup">
+        <button id="transUpBtn" title="Transpose whole track up 1 semitone">Track &#9650; Semi</button>
+        <button id="transDownBtn" title="Transpose whole track down 1 semitone">Track &#9660; Semi</button>
+      </div>
+    </div>
   </div>
 </div>
+
+<div id="rollDivider"></div>
 
 <!-- ================= PIANO ROLL ================= -->
 <div id="rollWrap">
@@ -300,7 +326,6 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
   </div>
   <div id="gridScroll">
     <div id="gridInner">
-      <div id="loopBar"><div id="loopRegion"><div id="loopHandleL" class="loopHandle"></div><div id="loopHandleR" class="loopHandle"></div></div></div>
       <canvas id="gridCanvas"></canvas>
       <div id="noteLayer"></div>
       <div id="selectionBox"></div>
@@ -353,6 +378,7 @@ let state = {
   loop:{enabled:false, start:0, end:16}
 };
 let selectedNoteIds = new Set();
+let selectedRegionIds = new Set(); // shift-selected split-region blocks in the arrange timeline
 let nextTrackId=1, nextNoteId=1;
 let editContext = "notes"; // "notes" or "track" — decides what Ctrl+C/Ctrl+V act on
 
@@ -401,7 +427,7 @@ function restoreSnapshot(snap){
     buildChain(track);
     return track;
   });
-  selectedNoteIds.clear();
+  selectedNoteIds.clear(); selectedRegionIds.clear();
   renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
   recomputeStepsTotal();
 }
@@ -474,7 +500,7 @@ function getNoiseBuffer(){
   noiseBufferCache = buf; return buf;
 }
 
-function playNote(track, midi, startTime, durSec){
+function playNote(track, midi, startTime, durSec, bendToMidi){
   if(!track._chain) buildChain(track);
   const inst = track.instrument;
   const env = actx.createGain();
@@ -487,14 +513,18 @@ function playNote(track, midi, startTime, durSec){
   env.gain.setValueAtTime(peak, sustainEnd);
   env.gain.linearRampToValueAtTime(0.0001, sustainEnd+rel);
   const stopAt = sustainEnd+rel+0.02;
+  const hasBend = bendToMidi!=null && bendToMidi!==midi;
 
   if(inst.wave==="custom" && inst.customBuffer){
     const src = actx.createBufferSource(); src.buffer = inst.customBuffer;
-    src.playbackRate.value = Math.pow(2,(midi-inst.customBaseMidi)/12);
+    src.playbackRate.setValueAtTime(Math.pow(2,(midi-inst.customBaseMidi)/12), startTime);
+    if(hasBend) src.playbackRate.linearRampToValueAtTime(Math.pow(2,(bendToMidi-inst.customBaseMidi)/12), sustainEnd);
     src.connect(env); src.start(startTime); src.stop(stopAt);
   } else if(inst.wave==="noise"){
     const src = actx.createBufferSource(); src.buffer = getNoiseBuffer(); src.loop=true;
-    const bp = actx.createBiquadFilter(); bp.type="bandpass"; bp.frequency.value = midiToFreq(midi)*2; bp.Q.value=1.2;
+    const bp = actx.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=1.2;
+    bp.frequency.setValueAtTime(midiToFreq(midi)*2, startTime);
+    if(hasBend) bp.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi)*2, sustainEnd);
     src.connect(bp); bp.connect(env);
     src.start(startTime); src.stop(stopAt);
   } else if(inst.wave==="pulse25" || inst.wave==="pulse12"){
@@ -504,11 +534,15 @@ function playNote(track, midi, startTime, durSec){
     const duty = inst.wave==="pulse25"?0.25:0.125;
     for(let n=1;n<16;n++){ real[n]=0; imag[n]=(2/(n*Math.PI))*Math.sin(n*Math.PI*duty); }
     const wave = actx.createPeriodicWave(real,imag,{disableNormalization:false});
-    osc.setPeriodicWave(wave); osc.frequency.value = midiToFreq(midi);
+    osc.setPeriodicWave(wave);
+    osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
+    if(hasBend) osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
   } else {
     const osc = actx.createOscillator();
-    osc.type = inst.wave; osc.frequency.value = midiToFreq(midi);
+    osc.type = inst.wave;
+    osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
+    if(hasBend) osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
   }
 }
@@ -561,7 +595,7 @@ function schedulerTick(){
       if(note.step >= scheduledUpTo && note.step < horizon){
         const t = playCtxStartTime + (note.step - playStepAt0)*stepDurSec();
         if(t >= actx.currentTime-0.01){
-          playNote(track, note.pitch, t, note.dur*stepDurSec()*0.92);
+          playNote(track, note.pitch, t, note.dur*stepDurSec()*0.92, note.bendTo);
         }
       }
     });
@@ -598,9 +632,11 @@ function positionOverviewFlag(){
    ====================================================================== */
 function renderLoopUI(){
   const region = document.getElementById("loopRegion");
+  if(!region) return;
+  const spb = stepsPerBar();
   region.style.display = "block";
-  region.style.left = (state.loop.start*STEP_W)+"px";
-  region.style.width = Math.max(4,(state.loop.end-state.loop.start)*STEP_W)+"px";
+  region.style.left = (state.loop.start/spb*BAR_PX)+"px";
+  region.style.width = Math.max(4,(state.loop.end-state.loop.start)/spb*BAR_PX)+"px";
   region.classList.toggle("enabled", state.loop.enabled);
 }
 
@@ -666,7 +702,6 @@ function sizeGrid(){
   gridCanvas.width=w; gridCanvas.height=h; gridCanvas.style.width=w+"px"; gridCanvas.style.height=h+"px";
   noteLayer.style.width=w+"px"; noteLayer.style.height=h+"px";
   drawGridLines();
-  renderLoopUI();
 }
 
 // grow the timeline (grid + ruler) to keep some empty room past whatever the furthest note/track content reaches —
@@ -746,15 +781,28 @@ function renderNotes(){
   if(!track) return;
   track.notes.forEach(note=>{
     const row = midiToRow(note.pitch);
+    const hasBend = note.bendTo!=null && note.bendTo!==note.pitch;
     const div = document.createElement("div");
-    div.className = "note"+(selectedNoteIds.has(note.id)?" selected":"");
+    div.className = "note"+(selectedNoteIds.has(note.id)?" selected":"")+(hasBend?" bend":"");
     div.style.left=(note.step*STEP_W+1)+"px";
     div.style.top=(row*ROW_H+1)+"px";
     div.style.width=(note.dur*STEP_W-2)+"px";
     div.style.height=(ROW_H-2)+"px";
-    div.style.background = track.color;
+    div.style.background = hasBend
+      ? "linear-gradient(to right, "+track.color+", "+(note.bendTo<note.pitch? "#6fa8ff":"#ff9d6f")+")"
+      : track.color;
     div.dataset.id = note.id;
-    div.title = midiToName(note.pitch);
+    div.title = hasBend ? "Slurred: "+midiToName(note.pitch)+" → "+midiToName(note.bendTo) : midiToName(note.pitch);
+    if(hasBend){
+      const label = document.createElement("span");
+      label.className = "bendLabel";
+      label.textContent = "→ "+midiToName(note.bendTo);
+      div.appendChild(label);
+    }
+    const grip = document.createElement("div");
+    grip.className = "bendHandle";
+    grip.title = "Drag sideways to resize, up/down to slur/tie into another pitch";
+    div.appendChild(grip);
     noteLayer.appendChild(div);
   });
 }
@@ -798,6 +846,9 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
 function buildOverview(){
   const inner = document.getElementById("timelineInner");
   inner.innerHTML = "";
+  const loopBar = document.createElement("div"); loopBar.id="loopBar";
+  loopBar.innerHTML = '<div id="loopRegion"><div id="loopHandleL" class="loopHandle"></div><div id="loopHandleR" class="loopHandle"></div></div>';
+  inner.appendChild(loopBar);
   const ruler = document.createElement("div"); ruler.id="arrangeRuler"; inner.appendChild(ruler);
   const ph = document.createElement("div"); ph.id="playheadOverview"; inner.appendChild(ph);
   const flag = document.createElement("div"); flag.id="playheadOverviewFlag"; inner.appendChild(flag);
@@ -824,6 +875,7 @@ function buildOverview(){
   inner.style.width = totalW+"px";
   renderArrangeRuler(totalW);
   renderPlayheads();
+  renderLoopUI();
 }
 
 // renders one overview block spanning [startStep,endStep) in a track's timeline row, with a mini note-pattern preview
@@ -832,7 +884,7 @@ function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
   const left = startStep/spb*BAR_PX;
   const blockW = Math.max(20, (endStep-startStep)/spb*BAR_PX - 3);
   const block = document.createElement("div");
-  block.className = "overviewBlock";
+  block.className = "overviewBlock"+(regionId!=null && selectedRegionIds.has(regionId) ? " regionSelected" : "");
   block.style.left = left+"px";
   block.style.width = blockW+"px";
   block.style.background = track.color;
@@ -923,11 +975,22 @@ function refreshInstrumentEditor(){
 /* ======================================================================
    SELECT / ADD TRACK
    ====================================================================== */
-function selectTrack(id){
+function selectTrack(id, opts){
   state.selectedTrackId = id;
   editContext = "track";
   selectedNoteIds.clear();
   renderTrackList(); refreshInstrumentEditor(); renderNotes();
+  if(opts && opts.scrollToFirstNote) scrollGridToFirstNote(id);
+}
+// bring the piano roll to wherever a track's earliest note sits, with that note pinned near the left edge
+function scrollGridToFirstNote(trackId){
+  const track = state.tracks.find(t=>t.id===trackId);
+  if(!track || !track.notes.length) return;
+  const firstNote = track.notes.reduce((a,b)=> b.step<a.step ? b : a);
+  gridScroll.scrollLeft = Math.max(0, firstNote.step*STEP_W - 40);
+  const row = midiToRow(firstNote.pitch);
+  gridScroll.scrollTop = Math.max(0, row*ROW_H - gridScroll.clientHeight/2);
+  syncPianoScroll();
 }
 function addTrack(){
   pushHistory();
@@ -976,9 +1039,39 @@ function noteOverlapMaxDur(track, row, step, desiredDur, excludeId){
 noteLayer.addEventListener("mousedown", onGridMouseDown);
 gridCanvas.addEventListener("mousedown", onGridMouseDown);
 
+// double-click a tile to delete it
+noteLayer.addEventListener("dblclick", (e)=>{
+  const track = selectedTrack(); if(!track) return;
+  const {step,row} = xyToStepRow(e.clientX,e.clientY);
+  const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
+  if(!hitNote) return;
+  pushHistory();
+  track.notes = track.notes.filter(n=>n.id!==hitNote.id);
+  selectedNoteIds.delete(hitNote.id);
+  renderNotes(); buildOverview(); recomputeStepsTotal();
+  e.stopPropagation(); e.preventDefault();
+});
+
 function onGridMouseDown(e){
   const track = selectedTrack(); if(!track) return;
   editContext = "notes";
+
+  // the little grip on a tile's right edge: drag sideways to resize, up/down to slur/tie into another pitch
+  if(e.target.classList && e.target.classList.contains("bendHandle")){
+    const noteEl = e.target.closest(".note");
+    const note = track.notes.find(n=>n.id===Number(noteEl.dataset.id));
+    if(note){
+      pushHistory();
+      // the slur target maps 1:1 to the row the cursor is over (so it always matches where notes sit
+      // elsewhere on the grid), but that mapping only "engages" once the mouse has actually moved some
+      // vertical distance — otherwise just touching the grip to resize horizontally would instantly
+      // snap an existing slur back to the note's own pitch
+      drag = {mode:"bend", noteId:note.id, startClientY:e.clientY, bendEngaged:false};
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+  }
+
   const {step,row,x,y} = xyToStepRow(e.clientX,e.clientY);
 
   // grab the playhead if the click lands near its current position
@@ -993,9 +1086,8 @@ function onGridMouseDown(e){
   if(step<0||step>=STEPS_TOTAL||row<0||row>=TOTAL_ROWS) return;
 
   if(e.shiftKey || e.altKey){
-    // rubber band select
-    selectedNoteIds.clear(); renderNotes();
-    drag = {mode:"select", x0:x, y0:y};
+    // rubber band select — keeps whatever's already selected and adds whatever the band covers
+    drag = {mode:"select", x0:x, y0:y, baseline:new Set(selectedNoteIds)};
     const box = document.getElementById("selectionBox");
     box.style.display="block"; box.style.left=x+"px"; box.style.top=y+"px"; box.style.width="0px"; box.style.height="0px";
     e.preventDefault();
@@ -1006,6 +1098,7 @@ function onGridMouseDown(e){
   // click happened to land on) so clicking anywhere on/near a tile always selects it — never deletes it.
   const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
   if(hitNote){
+    if(e.detail>=2){ e.preventDefault(); return; } // double-click: let the dblclick handler delete it
     if(!state.playing) previewNote(track, hitNote.pitch);
     if(!selectedNoteIds.has(hitNote.id)){
       if(!e.shiftKey) selectedNoteIds.clear();
@@ -1015,8 +1108,8 @@ function onGridMouseDown(e){
       selectedNoteIds.delete(hitNote.id); renderNotes(); return;
     }
     pushHistory();
-    const originNotes = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur}));
-    drag = {mode:"move", startStep:step, startMidiRow:row, origin:originNotes, moved:false};
+    const originNotes = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null}));
+    drag = {mode:"move", startStep:step, startMidiRow:row, origin:originNotes, moved:false, lastPreviewPitch:hitNote.pitch};
     e.preventDefault();
     return;
   }
@@ -1033,8 +1126,8 @@ function previewNote(track, midi){
 
 window.addEventListener("mousemove", (e)=>{
   if(loopDrag){
-    const rect = gridInner.getBoundingClientRect();
-    const stepAt = (e.clientX-rect.left)/STEP_W;
+    const rect = document.getElementById("timelineInner").getBoundingClientRect();
+    const stepAt = (e.clientX-rect.left)/BAR_PX*stepsPerBar();
     if(loopDrag.mode==="resizeL"){
       state.loop.start = Math.max(0, Math.min(state.loop.end-1, Math.round(stepAt)));
     } else if(loopDrag.mode==="resizeR"){
@@ -1104,7 +1197,7 @@ window.addEventListener("mousemove", (e)=>{
     box.style.left=left+"px"; box.style.top=top+"px"; box.style.width=w+"px"; box.style.height=h+"px";
     const s0=Math.floor(left/STEP_W), s1=Math.ceil((left+w)/STEP_W);
     const r0=Math.floor(top/ROW_H), r1=Math.ceil((top+h)/ROW_H);
-    selectedNoteIds.clear();
+    selectedNoteIds = new Set(drag.baseline);
     track.notes.forEach(n=>{
       const r = midiToRow(n.pitch);
       if(n.step+n.dur>s0 && n.step<s1 && r>=r0 && r<r1) selectedNoteIds.add(n.id);
@@ -1116,7 +1209,8 @@ window.addEventListener("mousemove", (e)=>{
     const candidates = drag.origin.map(o=>({
       id:o.id, dur:o.dur,
       newStep: Math.max(0, Math.min(STEPS_TOTAL-o.dur, o.step+dStep)),
-      newPitch: Math.max(0, Math.min(127, o.pitch-dRow))
+      newPitch: Math.max(0, Math.min(127, o.pitch-dRow)),
+      newBendTo: o.bendTo!=null ? Math.max(0, Math.min(127, o.bendTo-dRow)) : null
     }));
     const valid = candidates.every(c=>{
       const r = midiToRow(c.newPitch);
@@ -1126,9 +1220,16 @@ window.addEventListener("mousemove", (e)=>{
       drag.moved=true;
       candidates.forEach(c=>{
         const n = track.notes.find(x=>x.id===c.id); if(!n) return;
-        n.step=c.newStep; n.pitch=c.newPitch;
+        n.step=c.newStep; n.pitch=c.newPitch; n.bendTo=c.newBendTo;
       });
       renderNotes();
+      if(dRow!==0 && candidates.length){
+        const pitchNow = candidates[0].newPitch;
+        if(drag.lastPreviewPitch!==pitchNow){
+          if(!state.playing) previewNote(track, pitchNow);
+          drag.lastPreviewPitch = pitchNow;
+        }
+      }
     }
     showTooltip(e.clientX, e.clientY, "Δstep "+dStep+"  Δpitch "+(-dRow));
   } else if(drag.mode==="place"){
@@ -1140,7 +1241,7 @@ window.addEventListener("mousemove", (e)=>{
       const dur = noteOverlapMaxDur(track, drag.row, drag.startStep, desiredDur, drag.noteId);
       if(drag.noteId==null){
         drag.noteId = nextNoteId++;
-        const newNote = {id:drag.noteId, step:drag.startStep, pitch:drag.pitch, dur};
+        const newNote = {id:drag.noteId, step:drag.startStep, pitch:drag.pitch, dur, bendTo:null};
         track.notes.push(newNote);
         extendRegionsForNote(track, newNote);
         previewNote(track, drag.pitch);
@@ -1150,6 +1251,34 @@ window.addEventListener("mousemove", (e)=>{
       }
       renderNotes();
       showTooltip(e.clientX, e.clientY, dur+" step"+(dur===1?"":"s"));
+    }
+  } else if(drag.mode==="bend"){
+    const note = track.notes.find(n=>n.id===drag.noteId);
+    if(note){
+      // horizontal movement resizes the note's length, same as dragging a fresh tile's end point
+      const endStep = Math.max(note.step, step);
+      const desiredDur = endStep - note.step + 1;
+      const newDur = noteOverlapMaxDur(track, midiToRow(note.pitch), note.step, desiredDur, note.id);
+      if(newDur!==note.dur){
+        note.dur = newDur;
+        extendRegionsForNote(track, note);
+      }
+
+      // vertical movement sets the slur/tie target — the cursor's row maps straight to a pitch, 1:1
+      // with wherever notes actually sit on the grid, but that mapping only "engages" once the mouse
+      // has moved a few real pixels vertically, so a horizontal-only resize can't touch an existing slur
+      if(!drag.bendEngaged && Math.abs(e.clientY-drag.startClientY)>5) drag.bendEngaged = true;
+      if(drag.bendEngaged){
+        const clampedRow = Math.max(0, Math.min(TOTAL_ROWS-1, row));
+        const newPitch = rowToMidi(clampedRow);
+        if(newPitch !== (note.bendTo??note.pitch)){
+          note.bendTo = newPitch===note.pitch ? null : newPitch;
+        }
+      }
+
+      renderNotes();
+      const lenText = note.dur+" step"+(note.dur===1?"":"s");
+      showTooltip(e.clientX, e.clientY, note.bendTo!=null ? lenText+" · slur to "+midiToName(note.bendTo) : lenText);
     }
   }
 });
@@ -1170,7 +1299,7 @@ window.addEventListener("mouseup", ()=>{
       if(track){
         if(!drag.dragged){
           const dur = noteOverlapMaxDur(track, drag.row, drag.startStep, state.noteLenSteps, null);
-          const newNote = {id: nextNoteId++, step:drag.startStep, pitch:drag.pitch, dur};
+          const newNote = {id: nextNoteId++, step:drag.startStep, pitch:drag.pitch, dur, bendTo:null};
           track.notes.push(newNote);
           extendRegionsForNote(track, newNote);
           if(!state.playing) previewNote(track, drag.pitch);
@@ -1180,8 +1309,15 @@ window.addEventListener("mouseup", ()=>{
         recomputeStepsTotal();
       }
     }
+    if(drag.mode==="bend"){ buildOverview(); recomputeStepsTotal(); }
   }
   drag=null; hideTooltip();
+});
+
+// range sliders (volume/EQ/etc.) shouldn't keep keyboard focus after the drag ends —
+// otherwise stray Delete/Backspace/arrow presses get eaten by the slider instead of the note editor
+document.addEventListener("mouseup",(e)=>{
+  if(e.target.tagName==="INPUT" && e.target.type==="range") e.target.blur();
 });
 
 function showTooltip(x,y,text){
@@ -1191,8 +1327,10 @@ function showTooltip(x,y,text){
 function hideTooltip(){ document.getElementById("dragTooltip").style.display="none"; }
 
 document.addEventListener("keydown", (e)=>{
-  const tag = document.activeElement.tagName;
-  if(tag==="INPUT"||tag==="SELECT"||tag==="TEXTAREA") return;
+  const activeEl = document.activeElement;
+  const tag = activeEl.tagName;
+  const isTextEntry = tag==="SELECT" || tag==="TEXTAREA" || (tag==="INPUT" && activeEl.type!=="range");
+  if(isTextEntry) return;
 
   if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="z"){
     e.preventDefault();
@@ -1210,7 +1348,7 @@ document.addEventListener("keydown", (e)=>{
       if(!track) return;
       state.trackClipboard = {
         name:track.name, color:track.color, instrument:Object.assign({},track.instrument),
-        volume:track.volume, notes: track.notes.map(n=>({step:n.step,pitch:n.pitch,dur:n.dur})),
+        volume:track.volume, notes: track.notes.map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null})),
         regions: track.regions ? track.regions.map(r=>({start:r.start,end:r.end})) : null
       };
       if(k==="x"){
@@ -1244,13 +1382,13 @@ document.addEventListener("keydown", (e)=>{
   const track = selectedTrack(); if(!track) return;
 
   if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="c"){
-    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur}));
+    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null}));
     if(state.clipboard.length) toast("Copied "+state.clipboard.length+" note(s)");
     e.preventDefault();
   } else if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="x"){
     if(!selectedNoteIds.size) return;
     pushHistory();
-    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur}));
+    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null}));
     track.notes = track.notes.filter(n=>!selectedNoteIds.has(n.id));
     selectedNoteIds.clear();
     renderNotes(); buildOverview();
@@ -1264,7 +1402,7 @@ document.addEventListener("keydown", (e)=>{
     const newIds = [];
     state.clipboard.forEach(n=>{
       const id = nextNoteId++;
-      const newNote = {id, step: pasteAt+(n.step-minStep), pitch:n.pitch, dur:n.dur};
+      const newNote = {id, step: pasteAt+(n.step-minStep), pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null};
       track.notes.push(newNote);
       extendRegionsForNote(track, newNote);
       newIds.push(id);
@@ -1285,7 +1423,10 @@ document.addEventListener("keydown", (e)=>{
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const p = Math.min(127,n.pitch+1), r = midiToRow(p);
-      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && n.step<o.step+o.dur && n.step+n.dur>o.step)) n.pitch=p;
+      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && n.step<o.step+o.dur && n.step+n.dur>o.step)){
+        if(n.bendTo!=null) n.bendTo = Math.min(127, n.bendTo+1);
+        n.pitch=p;
+      }
     });
     renderNotes(); e.preventDefault();
   } else if(e.key==="ArrowDown" && selectedNoteIds.size){
@@ -1293,7 +1434,10 @@ document.addEventListener("keydown", (e)=>{
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const p = Math.max(0,n.pitch-1), r = midiToRow(p);
-      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && n.step<o.step+o.dur && n.step+n.dur>o.step)) n.pitch=p;
+      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && n.step<o.step+o.dur && n.step+n.dur>o.step)){
+        if(n.bendTo!=null) n.bendTo = Math.max(0, n.bendTo-1);
+        n.pitch=p;
+      }
     });
     renderNotes(); e.preventDefault();
   } else if(e.key==="ArrowLeft" && selectedNoteIds.size){
@@ -1341,28 +1485,30 @@ document.getElementById("playheadGrip").addEventListener("mousedown",(e)=>{
 /* ======================================================================
    LOOP REGION INTERACTION
    ====================================================================== */
-document.getElementById("loopHandleL").addEventListener("mousedown",(e)=>{
-  loopDrag = {mode:"resizeL"};
-  e.preventDefault(); e.stopPropagation();
-});
-document.getElementById("loopHandleR").addEventListener("mousedown",(e)=>{
-  loopDrag = {mode:"resizeR"};
-  e.preventDefault(); e.stopPropagation();
-});
-document.getElementById("loopRegion").addEventListener("mousedown",(e)=>{
-  if(e.target.classList.contains("loopHandle")) return;
-  const rect = gridInner.getBoundingClientRect();
-  loopDrag = {mode:"move", downStep:(e.clientX-rect.left)/STEP_W, startStart:state.loop.start, startEnd:state.loop.end};
-  e.preventDefault(); e.stopPropagation();
-});
-document.getElementById("loopBar").addEventListener("mousedown",(e)=>{
-  if(e.target.id!=="loopBar") return; // background click only, not the region/handles
-  const rect = gridInner.getBoundingClientRect();
-  const startStep = Math.max(0, Math.round((e.clientX-rect.left)/STEP_W));
-  // only redefine the loop once the user actually drags — a bare click on empty ruler space
-  // shouldn't collapse/replace whatever loop region is already set
-  loopDrag = {mode:"create", downX:e.clientX, startStep, dragged:false};
-  e.preventDefault();
+// the loop bar/region/handles now live in the arrange timeline and get rebuilt on every buildOverview() call,
+// so listeners are delegated to the stable #timelineInner node rather than bound to the (transient) elements themselves
+document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
+  const rect = document.getElementById("timelineInner").getBoundingClientRect();
+  const spb = stepsPerBar();
+  if(e.target.id==="loopHandleL"){
+    loopDrag = {mode:"resizeL"};
+    e.preventDefault(); e.stopPropagation(); return;
+  }
+  if(e.target.id==="loopHandleR"){
+    loopDrag = {mode:"resizeR"};
+    e.preventDefault(); e.stopPropagation(); return;
+  }
+  if(e.target.id==="loopRegion"){
+    loopDrag = {mode:"move", downStep:(e.clientX-rect.left)/BAR_PX*spb, startStart:state.loop.start, startEnd:state.loop.end};
+    e.preventDefault(); e.stopPropagation(); return;
+  }
+  if(e.target.id==="loopBar"){
+    const startStep = Math.max(0, Math.round((e.clientX-rect.left)/BAR_PX*spb));
+    // only redefine the loop once the user actually drags — a bare click on empty ruler space
+    // shouldn't collapse/replace whatever loop region is already set
+    loopDrag = {mode:"create", downX:e.clientX, startStep, dragged:false};
+    e.preventDefault(); e.stopPropagation(); return;
+  }
 });
 document.getElementById("loopBtn").addEventListener("click",()=>{
   state.loop.enabled = !state.loop.enabled;
@@ -1422,7 +1568,7 @@ document.getElementById("trackList").addEventListener("input",(e)=>{
 document.getElementById("timelineInner").addEventListener("click",(e)=>{
   if(suppressTimelineClick){ suppressTimelineClick=false; return; }
   const row = e.target.closest(".timelineRow"); if(!row) return;
-  selectTrack(Number(row.dataset.id));
+  selectTrack(Number(row.dataset.id), {scrollToFirstNote:true});
 });
 document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
   const blockEl = e.target.closest(".overviewBlock");
@@ -1431,10 +1577,23 @@ document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
     const trackId = Number(rowEl.dataset.id);
     const track = state.tracks.find(t=>t.id===trackId);
     if(!track) return;
-    selectTrack(trackId);
+    const regionId = blockEl.dataset.regionId!=null ? Number(blockEl.dataset.regionId) : null;
+
+    if(e.shiftKey && regionId!=null){
+      // shift-click toggles this region into/out of the multi-selection, without starting a drag
+      if(selectedRegionIds.has(regionId)) selectedRegionIds.delete(regionId);
+      else selectedRegionIds.add(regionId);
+      buildOverview();
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+    selectedRegionIds = regionId!=null ? new Set([regionId]) : new Set();
+
+    // clicking directly on a block rebuilds the timeline DOM synchronously (via selectTrack -> buildOverview),
+    // which means the native "click" event never fires afterward — so the scroll-to-first-note has to happen here
+    selectTrack(trackId, {scrollToFirstNote:true});
     pushHistory();
     document.body.style.cursor = "grabbing";
-    const regionId = blockEl.dataset.regionId!=null ? Number(blockEl.dataset.regionId) : null;
     if(regionId!=null){
       // dragging one split-off region: only its own notes move, clamped so it can't cross into a neighboring region
       const idx = track.regions.findIndex(r=>r.id===regionId);
@@ -1458,6 +1617,7 @@ document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
     e.preventDefault(); e.stopPropagation();
     return;
   }
+  if(selectedRegionIds.size){ selectedRegionIds.clear(); buildOverview(); }
   const rect = document.getElementById("timelineInner").getBoundingClientRect();
   const x = e.clientX-rect.left;
   const phX = currentPlayStep()/stepsPerBar()*BAR_PX;
@@ -1544,10 +1704,14 @@ bindSlider("eqHighSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instru
 bindSlider("revSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.reverb=v; document.getElementById("revVal").textContent=v+"%"; applyInstrumentToChain(t); });
 
 document.getElementById("transUpBtn").addEventListener("click",()=>{
-  const t=selectedTrack(); if(!t)return; pushHistory(); t.notes.forEach(n=>n.pitch=Math.min(127,n.pitch+1)); renderNotes(); toast("Transposed "+t.name+" up 1 semitone");
+  const t=selectedTrack(); if(!t)return; pushHistory();
+  t.notes.forEach(n=>{ n.pitch=Math.min(127,n.pitch+1); if(n.bendTo!=null) n.bendTo=Math.min(127,n.bendTo+1); });
+  renderNotes(); toast("Transposed "+t.name+" up 1 semitone");
 });
 document.getElementById("transDownBtn").addEventListener("click",()=>{
-  const t=selectedTrack(); if(!t)return; pushHistory(); t.notes.forEach(n=>n.pitch=Math.max(0,n.pitch-1)); renderNotes(); toast("Transposed "+t.name+" down 1 semitone");
+  const t=selectedTrack(); if(!t)return; pushHistory();
+  t.notes.forEach(n=>{ n.pitch=Math.max(0,n.pitch-1); if(n.bendTo!=null) n.bendTo=Math.max(0,n.bendTo-1); });
+  renderNotes(); toast("Transposed "+t.name+" down 1 semitone");
 });
 
 document.getElementById("uploadSampleBtn").addEventListener("click",()=>{
@@ -1609,7 +1773,7 @@ function serializeProject(){
       instrument: { wave:t.instrument.wave, volume:t.instrument.volume, attack:t.instrument.attack,
         release:t.instrument.release, eqLow:t.instrument.eqLow, eqMid:t.instrument.eqMid,
         eqHigh:t.instrument.eqHigh, reverb:t.instrument.reverb, customBaseMidi:t.instrument.customBaseMidi },
-      notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur})),
+      notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null})),
       regions: t.regions ? t.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null
     }))
   };
@@ -1650,13 +1814,13 @@ function loadProject(data){
     track.id = t.id||nextTrackId; nextTrackId=Math.max(nextTrackId, track.id+1);
     track.color = t.color||track.color; track.muted=!!t.muted; track.solo=!!t.solo; track.volume = t.volume??0.8;
     track.instrument = Object.assign(defaultInstrument(), t.instrument||{});
-    track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur}; });
+    track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null}; });
     track.regions = (t.regions||null) && t.regions.map(r=>{ nextNoteId=Math.max(nextNoteId, (r.id||0)+1); return {id:r.id||nextNoteId++, start:r.start, end:r.end}; });
     buildChain(track);
     return track;
   });
   state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
-  selectedNoteIds.clear();
+  selectedNoteIds.clear(); selectedRegionIds.clear();
   undoStack=[]; redoStack=[];
   state.loop = {enabled:false, start:0, end:stepsPerBar()};
   sizeGrid(); buildPianoLabels(); drawGridLines();
@@ -1668,7 +1832,7 @@ document.getElementById("newBtn").addEventListener("click", ()=>{
   if(!confirm("Start a new project? Unsaved changes will be lost.")) return;
   stopPlayback(true);
   STEPS_TOTAL = STEPS_TOTAL_BASE;
-  state.tracks=[]; state.selectedTrackId=null; selectedNoteIds.clear();
+  state.tracks=[]; state.selectedTrackId=null; selectedNoteIds.clear(); selectedRegionIds.clear();
   undoStack=[]; redoStack=[];
   initDefaultProject();
 });
