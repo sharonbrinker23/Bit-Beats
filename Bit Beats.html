@@ -91,6 +91,7 @@
   <div id="instEditor">
     <div class="instTopRow">
       <label class="field">Track<span id="instTrackName">—</span></label>
+      <button id="advToggleBtn" class="small" title="Advanced track editor (automation)">Advanced&hellip;</button>
       <label class="field">Waveform
         <select id="waveSel">
           <option value="square">Square (8-bit)</option>
@@ -131,6 +132,26 @@
       </div>
     </div>
   </div>
+</div>
+
+<!-- ================= ADVANCED TRACK EDITOR (AUTOMATION) ================= -->
+<div id="advancedEditor" class="hidden">
+  <div id="advTabs">
+    <button data-param="volume" class="advTabBtn">Volume</button>
+    <button data-param="eqLow" class="advTabBtn">EQ Low</button>
+    <button data-param="pan" class="advTabBtn">Pan</button>
+    <button data-param="eqMid" class="advTabBtn">EQ Mid</button>
+    <button data-param="reverb" class="advTabBtn">Reverb</button>
+    <button data-param="eqHigh" class="advTabBtn">EQ High</button>
+  </div>
+  <div id="advLaneScroll">
+    <div id="advLaneInner">
+      <div id="advLaneHeader"></div>
+      <canvas id="advLaneCanvas"></canvas>
+      <div id="advPointLayer"></div>
+    </div>
+  </div>
+  <button id="advCloseBtn" title="Close advanced editor">&#10005;</button>
 </div>
 
 <div id="rollDivider"></div>

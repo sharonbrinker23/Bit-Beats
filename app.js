@@ -31,10 +31,11 @@ function rowIndexToMidi(rowIndex, totalRows){ // row 0 = top = highest pitch
 let state = {
   bpm:120, timeSig:[4,4], key:"C", mode:"Major", octaveFocus:4, noteLenSteps:4,
   tracks: [], selectedTrackId:null, clipboard:[], trackClipboard:null, playing:false, playStartStep:0,
-  loop:{enabled:false, start:0, end:16}
+  loop:{enabled:false, start:0, end:16}, advancedTrackId:null, advancedParam:"volume"
 };
 let selectedNoteIds = new Set();
 let selectedRegionIds = new Set(); // shift-selected split-region blocks in the arrange timeline
+let selectedAutoPointIds = new Set(); // selected automation dots in the advanced track editor
 let nextTrackId=1, nextNoteId=1;
 let editContext = "notes"; // "notes" or "track" — decides what Ctrl+C/Ctrl+V act on
 
@@ -42,9 +43,13 @@ function defaultInstrument(){
   return { wave:"square", volume:0.8, attack:5, release:80, eqLow:0, eqMid:0, eqHigh:0, reverb:0,
            customSampleData:null, customBaseMidi:60 };
 }
+function defaultAutomation(){
+  return { volume:[], pan:[], reverb:[], eqLow:[], eqMid:[], eqHigh:[] };
+}
 function makeTrack(name, colorIdx){
   return { id: nextTrackId++, name: name||("Track "+nextTrackId), color: TRACK_COLORS[colorIdx % TRACK_COLORS.length],
-           instrument: defaultInstrument(), notes: [], muted:false, solo:false, volume:0.8, regions:null };
+           instrument: defaultInstrument(), notes: [], muted:false, solo:false, volume:0.8, pan:50, regions:null,
+           automation: defaultAutomation() };
 }
 
 /* ======================================================================
@@ -52,14 +57,20 @@ function makeTrack(name, colorIdx){
    ====================================================================== */
 let undoStack = [], redoStack = [];
 let historyArmed = false;
+function cloneAutomation(automation){
+  const out = {};
+  Object.keys(automation).forEach(k=>{ out[k] = automation[k].map(p=>({...p})); });
+  return out;
+}
 function snapshotTracks(){
   return {
     selectedTrackId: state.selectedTrackId,
     tracks: state.tracks.map(t=>({
-      id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume,
+      id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan,
       instrument: Object.assign({}, t.instrument),
       notes: t.notes.map(n=>({...n})),
-      regions: t.regions ? t.regions.map(r=>({...r})) : null
+      regions: t.regions ? t.regions.map(r=>({...r})) : null,
+      automation: cloneAutomation(t.automation)
     }))
   };
 }
@@ -75,16 +86,18 @@ function endHistoryGesture(){ historyArmed = false; }
 function restoreSnapshot(snap){
   state.selectedTrackId = snap.selectedTrackId;
   state.tracks = snap.tracks.map(t=>{
-    const track = { id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume,
+    const track = { id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan??50,
       instrument: Object.assign({}, t.instrument), notes: t.notes.map(n=>({...n})),
-      regions: t.regions ? t.regions.map(r=>({...r})) : null };
+      regions: t.regions ? t.regions.map(r=>({...r})) : null,
+      automation: t.automation ? cloneAutomation(t.automation) : defaultAutomation() };
     nextTrackId = Math.max(nextTrackId, track.id+1);
     track.notes.forEach(n=>{ nextNoteId = Math.max(nextNoteId, n.id+1); });
+    Object.values(track.automation).forEach(pts=> pts.forEach(p=>{ nextNoteId = Math.max(nextNoteId, p.id+1); }));
     buildChain(track);
     return track;
   });
-  selectedNoteIds.clear(); selectedRegionIds.clear();
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+  selectedNoteIds.clear(); selectedRegionIds.clear(); selectedAutoPointIds.clear();
+  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
   recomputeStepsTotal();
 }
 function undo(){
@@ -156,6 +169,9 @@ function getNoiseBuffer(){
   noiseBufferCache = buf; return buf;
 }
 
+// every currently-sounding voice, so playback can be cut dead on pause/stop instead of letting
+// already-scheduled envelopes/oscillators ring out to their natural end
+let activeVoices = [];
 function playNote(track, midi, startTime, durSec, bendToMidi){
   if(!track._chain) buildChain(track);
   const inst = track.instrument;
@@ -170,12 +186,14 @@ function playNote(track, midi, startTime, durSec, bendToMidi){
   env.gain.linearRampToValueAtTime(0.0001, sustainEnd+rel);
   const stopAt = sustainEnd+rel+0.02;
   const hasBend = bendToMidi!=null && bendToMidi!==midi;
+  let source;
 
   if(inst.wave==="custom" && inst.customBuffer){
     const src = actx.createBufferSource(); src.buffer = inst.customBuffer;
     src.playbackRate.setValueAtTime(Math.pow(2,(midi-inst.customBaseMidi)/12), startTime);
     if(hasBend) src.playbackRate.linearRampToValueAtTime(Math.pow(2,(bendToMidi-inst.customBaseMidi)/12), sustainEnd);
     src.connect(env); src.start(startTime); src.stop(stopAt);
+    source = src;
   } else if(inst.wave==="noise"){
     const src = actx.createBufferSource(); src.buffer = getNoiseBuffer(); src.loop=true;
     const bp = actx.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=1.2;
@@ -183,6 +201,7 @@ function playNote(track, midi, startTime, durSec, bendToMidi){
     if(hasBend) bp.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi)*2, sustainEnd);
     src.connect(bp); bp.connect(env);
     src.start(startTime); src.stop(stopAt);
+    source = src;
   } else if(inst.wave==="pulse25" || inst.wave==="pulse12"){
     // approximate pulse wave via two detuned sawtooths (poor-man's PWM) -> simpler: use square with custom periodic wave
     const osc = actx.createOscillator();
@@ -194,13 +213,30 @@ function playNote(track, midi, startTime, durSec, bendToMidi){
     osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
     if(hasBend) osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
+    source = osc;
   } else {
     const osc = actx.createOscillator();
     osc.type = inst.wave;
     osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
     if(hasBend) osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
+    source = osc;
   }
+
+  // opportunistic cleanup of long-finished voices, so this array doesn't grow unbounded over a long session
+  activeVoices = activeVoices.filter(v=> v.stopAt > actx.currentTime);
+  activeVoices.push({env, source, stopAt});
+}
+
+// immediately silences every voice currently sounding — used on pause/stop so notes don't ring out
+// past where the transport actually stopped
+function silenceAllVoices(){
+  const now = actx.currentTime;
+  activeVoices.forEach(v=>{
+    try{ v.env.gain.cancelScheduledValues(now); v.env.gain.setValueAtTime(0, now); }catch(e){}
+    try{ v.source.stop(now); }catch(e){}
+  });
+  activeVoices = [];
 }
 
 /* ======================================================================
@@ -231,6 +267,7 @@ function stopPlayback(resetHead){
   clearInterval(schedulerTimer);
   document.getElementById("playBtn").innerHTML = "&#9654;";
   if(resetHead) state.playStartStep = 0; else state.playStartStep = currentPlayStep();
+  silenceAllVoices();
   renderPlayheads();
 }
 function schedulerTick(){
@@ -449,6 +486,10 @@ function renderNotes(){
       : track.color;
     div.dataset.id = note.id;
     div.title = hasBend ? "Slurred: "+midiToName(note.pitch)+" → "+midiToName(note.bendTo) : midiToName(note.pitch);
+    const leftGrip = document.createElement("div");
+    leftGrip.className = "leftHandle";
+    leftGrip.title = "Drag to trim the start of the note";
+    div.appendChild(leftGrip);
     const grip = document.createElement("div");
     grip.className = "bendHandle";
     grip.title = "Drag sideways to resize, up/down to slur/tie into another pitch";
@@ -607,6 +648,20 @@ function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
   label.style.position="relative"; label.style.zIndex="1"; label.style.pointerEvents="none";
   block.appendChild(label);
 
+  // edge grips so the block's span can be trimmed from either side, mirroring the note tile's
+  // left/right resize handles — for a track with no regions yet, grabbing an edge lazily turns its
+  // auto-computed span into a real (single) region the same way "Split at Playhead" does
+  const leftGrip = document.createElement("div");
+  leftGrip.className = "blockHandle blockHandleL";
+  leftGrip.dataset.trackId = track.id;
+  if(regionId!=null) leftGrip.dataset.regionId = regionId;
+  block.appendChild(leftGrip);
+  const rightGrip = document.createElement("div");
+  rightGrip.className = "blockHandle blockHandleR";
+  rightGrip.dataset.trackId = track.id;
+  if(regionId!=null) rightGrip.dataset.regionId = regionId;
+  block.appendChild(rightGrip);
+
   row.appendChild(block);
 }
 
@@ -640,14 +695,165 @@ function renderArrangeRuler(totalW){
 }
 
 /* ======================================================================
+   ADVANCED TRACK EDITOR (AUTOMATION LANES)
+   ====================================================================== */
+const ADV_LANE_H = 190;
+const ADV_PARAM_LABELS = {volume:"Volume", pan:"Pan", reverb:"Reverb", eqLow:"EQ Low", eqMid:"EQ Mid", eqHigh:"EQ High"};
+
+// the value (0-100) this parameter shows as a flat line until the user actually draws a curve for it —
+// this is what keeps an empty lane in sync with the track's own sliders, per param, rather than a fixed default
+function autoDefaultValue(track, param){
+  switch(param){
+    case "volume": return track.volume*100;
+    case "pan": return track.pan;
+    case "reverb": return track.instrument.reverb;
+    case "eqLow": return (track.instrument.eqLow+24)/48*100;
+    case "eqMid": return (track.instrument.eqMid+24)/48*100;
+    case "eqHigh": return (track.instrument.eqHigh+24)/48*100;
+    default: return 50;
+  }
+}
+function advTrack(){ return state.tracks.find(t=>t.id===state.advancedTrackId); }
+
+function renderAdvancedEditor(){
+  const panel = document.getElementById("advancedEditor");
+  const track = advTrack();
+  if(!track){ panel.classList.add("hidden"); return; }
+  panel.classList.remove("hidden");
+
+  document.querySelectorAll(".advTabBtn").forEach(b=> b.classList.toggle("active", b.dataset.param===state.advancedParam));
+
+  const header = document.getElementById("advLaneHeader");
+  header.textContent = track.name+" — "+ADV_PARAM_LABELS[state.advancedParam];
+  header.style.background = track.color;
+
+  const spb = stepsPerBar();
+  const totalW = Math.max(1, STEPS_TOTAL/spb*BAR_PX);
+  document.getElementById("advLaneInner").style.width = totalW+"px";
+  header.style.width = totalW+"px";
+
+  const canvas = document.getElementById("advLaneCanvas");
+  const dpr = window.devicePixelRatio||1;
+  canvas.width = totalW*dpr; canvas.height = ADV_LANE_H*dpr;
+  canvas.style.width = totalW+"px"; canvas.style.height = ADV_LANE_H+"px";
+  const ctx = canvas.getContext("2d"); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,totalW,ADV_LANE_H);
+
+  // faint track-colored backdrop, echoing the arrange overview block's own coloring
+  ctx.fillStyle = track.color; ctx.globalAlpha = 0.12; ctx.fillRect(0,0,totalW,ADV_LANE_H); ctx.globalAlpha = 1;
+
+  // reference gridlines at 100/50/0%
+  ctx.strokeStyle = "rgba(255,255,255,.12)"; ctx.lineWidth = 1;
+  [0,0.5,1].forEach(f=>{
+    const y = Math.round(ADV_LANE_H*(1-f))+.5;
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(totalW,y); ctx.stroke();
+  });
+  // bar lines, matching the arrange ruler's spacing
+  const totalBars = Math.ceil(STEPS_TOTAL/spb);
+  ctx.strokeStyle = "rgba(255,255,255,.08)";
+  for(let bar=0; bar<=totalBars; bar++){
+    const x = bar*BAR_PX+.5;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,ADV_LANE_H); ctx.stroke();
+  }
+
+  const points = track.automation[state.advancedParam].slice().sort((a,b)=>a.step-b.step);
+  const valueToY = v=> ADV_LANE_H-(v/100*ADV_LANE_H);
+  const stepToX = s=> s/spb*BAR_PX;
+
+  ctx.strokeStyle = "#6fa8ff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  if(points.length===0){
+    const y = valueToY(autoDefaultValue(track, state.advancedParam));
+    ctx.moveTo(0,y); ctx.lineTo(totalW,y);
+  } else {
+    ctx.moveTo(0, valueToY(points[0].value));
+    points.forEach(p=> ctx.lineTo(stepToX(p.step), valueToY(p.value)));
+    ctx.lineTo(totalW, valueToY(points[points.length-1].value));
+  }
+  ctx.stroke();
+
+  const layer = document.getElementById("advPointLayer");
+  layer.innerHTML = "";
+  points.forEach(p=>{
+    const dot = document.createElement("div");
+    dot.className = "autoPoint"+(selectedAutoPointIds.has(p.id)?" selected":"");
+    dot.style.left = stepToX(p.step)+"px";
+    dot.style.top = valueToY(p.value)+"px";
+    dot.dataset.id = p.id;
+    dot.title = Math.round(p.value)+"%";
+    layer.appendChild(dot);
+  });
+}
+
+let autoDrag = null; // {trackId, param, origin:[{id,step,value}], startStep, startValue}
+
+document.getElementById("advTabs").addEventListener("click",(e)=>{
+  const btn = e.target.closest(".advTabBtn"); if(!btn) return;
+  state.advancedParam = btn.dataset.param;
+  selectedAutoPointIds.clear();
+  renderAdvancedEditor();
+});
+document.getElementById("advToggleBtn").addEventListener("click", ()=>{
+  const t = selectedTrack(); if(!t) return;
+  if(state.advancedTrackId===t.id){ state.advancedTrackId = null; }
+  else { state.advancedTrackId = t.id; state.advancedParam = "volume"; selectedAutoPointIds.clear(); }
+  refreshInstrumentEditor();
+  renderAdvancedEditor();
+});
+document.getElementById("advCloseBtn").addEventListener("click", ()=>{
+  state.advancedTrackId = null; selectedAutoPointIds.clear();
+  refreshInstrumentEditor();
+  renderAdvancedEditor();
+});
+// double-click empty lane space to drop a new automation point at that step/value
+document.getElementById("advPointLayer").addEventListener("dblclick",(e)=>{
+  if(e.target.classList.contains("autoPoint")) return;
+  const track = advTrack(); if(!track) return;
+  const rect = document.getElementById("advLaneCanvas").getBoundingClientRect();
+  const spb = stepsPerBar();
+  const step = Math.max(0, (e.clientX-rect.left)/BAR_PX*spb);
+  const value = Math.max(0, Math.min(100, 100-(e.clientY-rect.top)/ADV_LANE_H*100));
+  pushHistory();
+  track.automation[state.advancedParam].push({id: nextNoteId++, step, value});
+  renderAdvancedEditor();
+});
+document.getElementById("advPointLayer").addEventListener("mousedown",(e)=>{
+  const dot = e.target.closest(".autoPoint"); if(!dot) return;
+  const track = advTrack(); if(!track) return;
+  const id = Number(dot.dataset.id);
+  if(e.shiftKey){
+    // shift-click toggles this dot into/out of the multi-selection, without starting a drag
+    if(selectedAutoPointIds.has(id)) selectedAutoPointIds.delete(id); else selectedAutoPointIds.add(id);
+    renderAdvancedEditor();
+    e.preventDefault(); e.stopPropagation();
+    return;
+  }
+  if(!selectedAutoPointIds.has(id)){ selectedAutoPointIds.clear(); selectedAutoPointIds.add(id); renderAdvancedEditor(); }
+  pushHistory();
+  const points = track.automation[state.advancedParam];
+  const origin = points.filter(p=>selectedAutoPointIds.has(p.id)).map(p=>({id:p.id, step:p.step, value:p.value}));
+  const rect = document.getElementById("advLaneCanvas").getBoundingClientRect();
+  const spb = stepsPerBar();
+  autoDrag = {
+    trackId: track.id, param: state.advancedParam, origin,
+    startStep: (e.clientX-rect.left)/BAR_PX*spb,
+    startValue: 100-(e.clientY-rect.top)/ADV_LANE_H*100
+  };
+  e.preventDefault(); e.stopPropagation();
+});
+
+/* ======================================================================
    INSTRUMENT EDITOR SYNC
    ====================================================================== */
 function refreshInstrumentEditor(){
   const track = selectedTrack();
   const editor = document.getElementById("instEditor");
-  if(!track){ editor.style.opacity=.4; editor.style.pointerEvents="none"; return; }
+  const advBtn = document.getElementById("advToggleBtn");
+  if(!track){ editor.style.opacity=.4; editor.style.pointerEvents="none"; advBtn.classList.remove("on"); return; }
   editor.style.opacity=1; editor.style.pointerEvents="auto";
   document.getElementById("instTrackName").textContent = track.name;
+  advBtn.classList.toggle("on", state.advancedTrackId===track.id);
   const inst = track.instrument;
   document.getElementById("waveSel").value = inst.wave;
   document.getElementById("volSlider").value = Math.round((track.volume)*100);
@@ -695,7 +901,8 @@ function deleteSelectedTrack(){
   pushHistory();
   state.tracks = state.tracks.filter(t=>t.id!==track.id);
   state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
-  renderTrackList(); refreshInstrumentEditor(); renderNotes();
+  if(state.advancedTrackId===track.id){ state.advancedTrackId=null; selectedAutoPointIds.clear(); }
+  renderTrackList(); refreshInstrumentEditor(); renderNotes(); renderAdvancedEditor();
 }
 
 /* ======================================================================
@@ -705,6 +912,7 @@ let drag = null; // {mode:'select'|'move'|'place', startX,startY, origin notes..
 let playheadDrag = null; // {type:'grid'|'overview'}
 let loopDrag = null; // {mode:'move'|'resizeL'|'resizeR', ...}
 let trackDrag = null; // {trackId, startX, origin}
+let blockResizeDrag = null; // {trackId, regionId, edge:'left'|'right', minBound, maxBound}
 let suppressTimelineClick = false;
 
 function xyToStepRow(clientX, clientY){
@@ -723,6 +931,19 @@ function noteOverlapMaxDur(track, row, step, desiredDur, excludeId){
     }
   });
   return Math.max(1, maxDur);
+}
+
+// earliest step a note can be trimmed back to from the left, given its right edge stays fixed at
+// `fixedEnd` — the mirror of noteOverlapMaxDur, so trimming from the left can't cross an earlier tile
+function noteOverlapMinStep(track, row, fixedEnd, excludeId){
+  let minStep = 0;
+  track.notes.forEach(n=>{
+    if(n.id===excludeId) return;
+    if(midiToRow(n.pitch)===row && n.step+n.dur<=fixedEnd){
+      minStep = Math.max(minStep, n.step+n.dur);
+    }
+  });
+  return Math.min(minStep, fixedEnd-1);
 }
 
 noteLayer.addEventListener("mousedown", onGridMouseDown);
@@ -745,6 +966,19 @@ function onGridMouseDown(e){
   const track = selectedTrack(); if(!track) return;
   editContext = "notes";
 
+  // the mirrored grip on a tile's left edge: drag to trim the start of the note while its right edge
+  // (and any slur target) stays put
+  if(e.target.classList && e.target.classList.contains("leftHandle")){
+    const noteEl = e.target.closest(".note");
+    const note = track.notes.find(n=>n.id===Number(noteEl.dataset.id));
+    if(note){
+      pushHistory();
+      drag = {mode:"resizeLeft", noteId:note.id, fixedEnd:note.step+note.dur};
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+  }
+
   // the little grip on a tile's right edge: drag sideways to resize, or (only if the note isn't already
   // slurred) up/down to start a new slur — once a slur exists, its target is adjusted via the separate
   // bendStub instead, so this handle stays dedicated to length once that stub appears
@@ -757,7 +991,7 @@ function onGridMouseDown(e){
       // elsewhere on the grid), but that mapping only "engages" once the mouse has actually moved some
       // vertical distance — otherwise just touching the grip to resize horizontally would instantly
       // snap an existing slur back to the note's own pitch
-      drag = {mode:"bend", noteId:note.id, startClientY:e.clientY, bendEngaged:false, allowBend: note.bendTo==null};
+      drag = {mode:"bend", noteId:note.id, startClientY:e.clientY, bendEngaged:false, allowBend: note.bendTo==null, lastPreviewPitch:null};
       e.preventDefault(); e.stopPropagation();
       return;
     }
@@ -769,7 +1003,7 @@ function onGridMouseDown(e){
     const note = track.notes.find(n=>n.id===Number(e.target.dataset.id));
     if(note){
       pushHistory();
-      drag = {mode:"bendAdjust", noteId:note.id};
+      drag = {mode:"bendAdjust", noteId:note.id, lastPreviewPitch:null};
       e.preventDefault(); e.stopPropagation();
       return;
     }
@@ -802,7 +1036,9 @@ function onGridMouseDown(e){
   const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
   if(hitNote){
     if(e.detail>=2){ e.preventDefault(); return; } // double-click: let the dblclick handler delete it
-    if(!state.playing) previewNote(track, hitNote.pitch);
+    // slurred tiles preview the slide itself (base pitch sliding into the target) rather than just
+    // the base pitch alone, compressed into the same short preview length
+    if(!state.playing) previewNote(track, hitNote.pitch, hitNote.bendTo);
     if(!selectedNoteIds.has(hitNote.id)){
       if(!e.shiftKey) selectedNoteIds.clear();
       selectedNoteIds.add(hitNote.id);
@@ -817,17 +1053,61 @@ function onGridMouseDown(e){
     return;
   }
 
+  // empty cell with an existing selection: the first click just clears it, matching how clicking empty
+  // space deselects elsewhere — placing a new note is a deliberate second click, not a side effect of
+  // dismissing whatever was highlighted
+  if(selectedNoteIds.size){
+    selectedNoteIds.clear();
+    renderNotes();
+    e.preventDefault();
+    return;
+  }
+
   // empty cell: hold + drag sets a custom note length (start -> end point); a short click places the default length
   pushHistory();
   drag = {mode:"place", row, startStep:step, pitch:rowToMidi(row), downX:e.clientX, downY:e.clientY, dragged:false, noteId:null};
   e.preventDefault();
 }
 
-function previewNote(track, midi){
-  playNote(track, midi, actx.currentTime+0.01, 0.18);
+function previewNote(track, midi, bendTo){
+  playNote(track, midi, actx.currentTime+0.01, 0.18, bendTo);
 }
 
 window.addEventListener("mousemove", (e)=>{
+  if(autoDrag){
+    const track = state.tracks.find(t=>t.id===autoDrag.trackId);
+    if(track){
+      const rect = document.getElementById("advLaneCanvas").getBoundingClientRect();
+      const spb = stepsPerBar();
+      const curStep = (e.clientX-rect.left)/BAR_PX*spb;
+      const curValue = 100-(e.clientY-rect.top)/ADV_LANE_H*100;
+      const dStep = curStep-autoDrag.startStep, dValue = curValue-autoDrag.startValue;
+      const points = track.automation[autoDrag.param];
+      autoDrag.origin.forEach(o=>{
+        const p = points.find(x=>x.id===o.id); if(!p) return;
+        p.step = Math.max(0, o.step+dStep);
+        p.value = Math.max(0, Math.min(100, o.value+dValue));
+      });
+      renderAdvancedEditor();
+    }
+    return;
+  }
+  if(blockResizeDrag){
+    const track = state.tracks.find(t=>t.id===blockResizeDrag.trackId);
+    const region = track && track.regions && track.regions.find(r=>r.id===blockResizeDrag.regionId);
+    if(region){
+      const rect = document.getElementById("timelineInner").getBoundingClientRect();
+      const spb = stepsPerBar();
+      const stepAt = Math.round((e.clientX-rect.left)/BAR_PX*spb);
+      if(blockResizeDrag.edge==="left"){
+        region.start = Math.max(blockResizeDrag.minBound, Math.min(region.end-1, stepAt));
+      } else {
+        region.end = Math.min(blockResizeDrag.maxBound, Math.max(region.start+1, stepAt));
+      }
+      buildOverview();
+    }
+    return;
+  }
   if(loopDrag){
     const rect = document.getElementById("timelineInner").getBoundingClientRect();
     const stepAt = (e.clientX-rect.left)/BAR_PX*stepsPerBar();
@@ -980,6 +1260,12 @@ window.addEventListener("mousemove", (e)=>{
           if(newPitch !== (note.bendTo??note.pitch)){
             note.bendTo = newPitch===note.pitch ? null : newPitch;
           }
+          // announce whatever pitch is currently under the cursor while the slur is being dragged out,
+          // same as retargeting an existing slur via the bendStub does
+          if(drag.lastPreviewPitch!==newPitch){
+            if(!state.playing) previewNote(track, newPitch);
+            drag.lastPreviewPitch = newPitch;
+          }
         }
       }
 
@@ -996,12 +1282,34 @@ window.addEventListener("mousemove", (e)=>{
         note.bendTo = newPitch===note.pitch ? null : newPitch;
         renderNotes();
       }
+      // announce whatever pitch the stub is currently hovering over, same as dragging a note
+      // vertically previews its new pitch — only re-fires when the hovered row actually changes
+      if(drag.lastPreviewPitch!==newPitch){
+        if(!state.playing) previewNote(track, newPitch);
+        drag.lastPreviewPitch = newPitch;
+      }
       showTooltip(e.clientX, e.clientY, note.bendTo!=null ? "slur to "+midiToName(note.bendTo) : "slur removed");
+    }
+  } else if(drag.mode==="resizeLeft"){
+    const note = track.notes.find(n=>n.id===drag.noteId);
+    if(note){
+      const fixedEnd = drag.fixedEnd;
+      const minStep = noteOverlapMinStep(track, midiToRow(note.pitch), fixedEnd, note.id);
+      const newStep = Math.max(minStep, Math.min(fixedEnd-1, step));
+      if(newStep!==note.step){
+        note.step = newStep;
+        note.dur = fixedEnd-newStep;
+        extendRegionsForNote(track, note);
+        renderNotes();
+      }
+      showTooltip(e.clientX, e.clientY, note.dur+" step"+(note.dur===1?"":"s"));
     }
   }
 });
 window.addEventListener("mouseup", ()=>{
   endHistoryGesture();
+  if(autoDrag){ autoDrag=null; return; }
+  if(blockResizeDrag){ blockResizeDrag=null; recomputeStepsTotal(); return; }
   if(loopDrag){ loopDrag=null; return; }
   if(trackDrag){ trackDrag=null; document.body.style.cursor=""; recomputeStepsTotal(); return; }
   if(playheadDrag){
@@ -1027,7 +1335,7 @@ window.addEventListener("mouseup", ()=>{
         recomputeStepsTotal();
       }
     }
-    if(drag.mode==="bend" || drag.mode==="bendAdjust"){ buildOverview(); recomputeStepsTotal(); }
+    if(drag.mode==="bend" || drag.mode==="bendAdjust" || drag.mode==="resizeLeft"){ buildOverview(); recomputeStepsTotal(); }
   }
   drag=null; hideTooltip();
 });
@@ -1095,6 +1403,21 @@ document.addEventListener("keydown", (e)=>{
     }
     e.preventDefault();
     return;
+  }
+
+  // automation dots delete the same way notes/tracks do — checked independently of the note-selection
+  // track below, since the advanced editor's target track need not be the currently selected one
+  if((e.key==="Delete"||e.key==="Backspace") && state.advancedTrackId!=null && selectedAutoPointIds.size){
+    const advT = advTrack();
+    if(advT){
+      pushHistory();
+      const points = advT.automation[state.advancedParam];
+      advT.automation[state.advancedParam] = points.filter(p=>!selectedAutoPointIds.has(p.id));
+      selectedAutoPointIds.clear();
+      renderAdvancedEditor();
+      e.preventDefault();
+      return;
+    }
   }
 
   const track = selectedTrack(); if(!track) return;
@@ -1206,27 +1529,33 @@ document.getElementById("playheadGrip").addEventListener("mousedown",(e)=>{
 // the loop bar/region/handles now live in the arrange timeline and get rebuilt on every buildOverview() call,
 // so listeners are delegated to the stable #timelineInner node rather than bound to the (transient) elements themselves
 document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
+  if(!e.target.closest("#loopBar")) return;
   const rect = document.getElementById("timelineInner").getBoundingClientRect();
   const spb = stepsPerBar();
-  if(e.target.id==="loopHandleL"){
+  const x = e.clientX-rect.left;
+  const regionLeftPx = state.loop.start/spb*BAR_PX;
+  const regionRightPx = state.loop.end/spb*BAR_PX;
+  // resize handles get a forgiving pixel-tolerance hit zone around the loop's edges, rather than
+  // relying on landing exactly on the thin 7px handle element — a click a couple pixels off used to
+  // fall through to "create" and silently replace the whole loop with a new sliver at the click point
+  const tolerance = 6;
+  if(Math.abs(x-regionLeftPx) <= tolerance){
     loopDrag = {mode:"resizeL"};
     e.preventDefault(); e.stopPropagation(); return;
   }
-  if(e.target.id==="loopHandleR"){
+  if(Math.abs(x-regionRightPx) <= tolerance){
     loopDrag = {mode:"resizeR"};
     e.preventDefault(); e.stopPropagation(); return;
   }
-  if(e.target.id==="loopRegion"){
-    loopDrag = {mode:"move", downStep:(e.clientX-rect.left)/BAR_PX*spb, startStart:state.loop.start, startEnd:state.loop.end};
+  if(x>regionLeftPx && x<regionRightPx){
+    loopDrag = {mode:"move", downStep:x/BAR_PX*spb, startStart:state.loop.start, startEnd:state.loop.end};
     e.preventDefault(); e.stopPropagation(); return;
   }
-  if(e.target.id==="loopBar"){
-    const startStep = Math.max(0, Math.round((e.clientX-rect.left)/BAR_PX*spb));
-    // only redefine the loop once the user actually drags — a bare click on empty ruler space
-    // shouldn't collapse/replace whatever loop region is already set
-    loopDrag = {mode:"create", downX:e.clientX, startStep, dragged:false};
-    e.preventDefault(); e.stopPropagation(); return;
-  }
+  // only redefine the loop once the user actually drags — a bare click on empty ruler space
+  // shouldn't collapse/replace whatever loop region is already set
+  const startStep = Math.max(0, Math.round(x/BAR_PX*spb));
+  loopDrag = {mode:"create", downX:e.clientX, startStep, dragged:false};
+  e.preventDefault(); e.stopPropagation();
 });
 document.getElementById("loopBtn").addEventListener("click",()=>{
   state.loop.enabled = !state.loop.enabled;
@@ -1289,6 +1618,36 @@ document.getElementById("timelineInner").addEventListener("click",(e)=>{
   selectTrack(Number(row.dataset.id), {scrollToFirstNote:true});
 });
 document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
+  const handleEl = e.target.closest(".blockHandle");
+  if(handleEl){
+    const trackId = Number(handleEl.dataset.trackId);
+    const track = state.tracks.find(t=>t.id===trackId);
+    if(!track || !track.notes.length) return;
+    pushHistory();
+    let regionId = handleEl.dataset.regionId!=null ? Number(handleEl.dataset.regionId) : null;
+    if(regionId==null){
+      // lazily turn this track's auto-computed span into a real (single) region — same as the first
+      // "Split at Playhead" does — so there's something concrete for the edge grip to trim
+      const spb = stepsPerBar();
+      const minStep = Math.min(...track.notes.map(n=>n.step));
+      const maxStep = Math.max(...track.notes.map(n=>n.step+n.dur));
+      const region = {id: nextNoteId++, start: Math.floor(minStep/spb)*spb, end: Math.ceil(maxStep/spb)*spb};
+      track.regions = [region];
+      regionId = region.id;
+    }
+    const idx = track.regions.findIndex(r=>r.id===regionId);
+    const region = track.regions[idx];
+    const prevRegion = track.regions[idx-1], nextRegion = track.regions[idx+1];
+    blockResizeDrag = {
+      trackId, regionId,
+      edge: handleEl.classList.contains("blockHandleL") ? "left" : "right",
+      minBound: prevRegion ? prevRegion.end : 0,
+      maxBound: nextRegion ? nextRegion.start : STEPS_TOTAL
+    };
+    buildOverview();
+    e.preventDefault(); e.stopPropagation();
+    return;
+  }
   const blockEl = e.target.closest(".overviewBlock");
   if(blockEl){
     const rowEl = e.target.closest(".timelineRow");
@@ -1413,13 +1772,13 @@ function bindSlider(id, cb){
 document.getElementById("waveSel").addEventListener("change",(e)=>{
   const t=selectedTrack(); if(!t) return; pushHistory(); t.instrument.wave=e.target.value; renderTrackList();
 });
-bindSlider("volSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.volume=v/100; document.getElementById("volVal").textContent=v; refreshAllTrackGains(); renderTrackList(); });
+bindSlider("volSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.volume=v/100; document.getElementById("volVal").textContent=v; refreshAllTrackGains(); renderTrackList(); renderAdvancedEditor(); });
 bindSlider("atkSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.attack=v; document.getElementById("atkVal").textContent=v+"ms"; });
 bindSlider("relSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.release=v; document.getElementById("relVal").textContent=v+"ms"; });
-bindSlider("eqLowSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqLow=v; document.getElementById("eqLowVal").textContent=v+"dB"; applyInstrumentToChain(t); });
-bindSlider("eqMidSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqMid=v; document.getElementById("eqMidVal").textContent=v+"dB"; applyInstrumentToChain(t); });
-bindSlider("eqHighSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqHigh=v; document.getElementById("eqHighVal").textContent=v+"dB"; applyInstrumentToChain(t); });
-bindSlider("revSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.reverb=v; document.getElementById("revVal").textContent=v+"%"; applyInstrumentToChain(t); });
+bindSlider("eqLowSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqLow=v; document.getElementById("eqLowVal").textContent=v+"dB"; applyInstrumentToChain(t); renderAdvancedEditor(); });
+bindSlider("eqMidSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqMid=v; document.getElementById("eqMidVal").textContent=v+"dB"; applyInstrumentToChain(t); renderAdvancedEditor(); });
+bindSlider("eqHighSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqHigh=v; document.getElementById("eqHighVal").textContent=v+"dB"; applyInstrumentToChain(t); renderAdvancedEditor(); });
+bindSlider("revSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.reverb=v; document.getElementById("revVal").textContent=v+"%"; applyInstrumentToChain(t); renderAdvancedEditor(); });
 
 document.getElementById("transUpBtn").addEventListener("click",()=>{
   const t=selectedTrack(); if(!t)return; pushHistory();
@@ -1487,12 +1846,13 @@ function serializeProject(){
     bpm: state.bpm, timeSig: state.timeSig, key: state.key, mode: state.mode,
     octaveFocus: state.octaveFocus, noteLenSteps: state.noteLenSteps,
     tracks: state.tracks.map(t=>({
-      id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume,
+      id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan,
       instrument: { wave:t.instrument.wave, volume:t.instrument.volume, attack:t.instrument.attack,
         release:t.instrument.release, eqLow:t.instrument.eqLow, eqMid:t.instrument.eqMid,
         eqHigh:t.instrument.eqHigh, reverb:t.instrument.reverb, customBaseMidi:t.instrument.customBaseMidi },
       notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null})),
-      regions: t.regions ? t.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null
+      regions: t.regions ? t.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null,
+      automation: cloneAutomation(t.automation)
     }))
   };
 }
@@ -1531,18 +1891,26 @@ function loadProject(data){
     const track = makeTrack(t.name, 0);
     track.id = t.id||nextTrackId; nextTrackId=Math.max(nextTrackId, track.id+1);
     track.color = t.color||track.color; track.muted=!!t.muted; track.solo=!!t.solo; track.volume = t.volume??0.8;
+    track.pan = t.pan??50;
     track.instrument = Object.assign(defaultInstrument(), t.instrument||{});
     track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null}; });
     track.regions = (t.regions||null) && t.regions.map(r=>{ nextNoteId=Math.max(nextNoteId, (r.id||0)+1); return {id:r.id||nextNoteId++, start:r.start, end:r.end}; });
+    track.automation = defaultAutomation();
+    if(t.automation){
+      Object.keys(track.automation).forEach(k=>{
+        track.automation[k] = (t.automation[k]||[]).map(p=>{ nextNoteId=Math.max(nextNoteId,(p.id||0)+1); return {id:p.id||nextNoteId++, step:p.step, value:p.value}; });
+      });
+    }
     buildChain(track);
     return track;
   });
   state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
-  selectedNoteIds.clear(); selectedRegionIds.clear();
+  state.advancedTrackId = null; state.advancedParam = "volume";
+  selectedNoteIds.clear(); selectedRegionIds.clear(); selectedAutoPointIds.clear();
   undoStack=[]; redoStack=[];
   state.loop = {enabled:false, start:0, end:stepsPerBar()};
   sizeGrid(); buildPianoLabels(); drawGridLines();
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
   recomputeStepsTotal();
   document.getElementById("loopBtn").classList.remove("on");
 }
@@ -1551,6 +1919,7 @@ document.getElementById("newBtn").addEventListener("click", ()=>{
   stopPlayback(true);
   STEPS_TOTAL = STEPS_TOTAL_BASE;
   state.tracks=[]; state.selectedTrackId=null; selectedNoteIds.clear(); selectedRegionIds.clear();
+  state.advancedTrackId=null; selectedAutoPointIds.clear();
   undoStack=[]; redoStack=[];
   initDefaultProject();
 });
@@ -1572,7 +1941,7 @@ function initDefaultProject(){
   const t1 = makeTrack("Lead Square",0); buildChain(t1); state.tracks.push(t1);
   const t2 = makeTrack("Bass Triangle",1); t2.instrument.wave="triangle"; buildChain(t2); state.tracks.push(t2);
   state.selectedTrackId = t1.id;
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
   const midi=(state.octaveFocus+1)*12;
   gridScroll.scrollTop = midiToRow(midi)*ROW_H - gridScroll.clientHeight/2;
   syncPianoScroll();
