@@ -58,6 +58,9 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 #trackListCol{
   width:230px; flex-shrink:0; border-right:1px solid var(--line); overflow-y:auto; background:var(--bg2);
 }
+#trackListHeaderSpacer{
+  position:sticky; top:0; z-index:4; height:18px; background:var(--bg1); border-bottom:1px solid var(--line);
+}
 #trackList{display:flex; flex-direction:column;}
 .trackRow{
   display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid var(--line);
@@ -74,7 +77,10 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 #addTrackBtn{margin:8px; }
 
 #timelineCol{flex:1; overflow:auto; position:relative;}
-#timelineInner{position:relative; height:100%;}
+#timelineInner{position:relative;}
+#arrangeRuler{
+  position:sticky; top:0; height:18px; z-index:4; background:var(--bg1); border-bottom:1px solid var(--line);
+}
 .timelineRow{
   height:46px; border-bottom:1px solid var(--line); position:relative; background-image:
     repeating-linear-gradient(to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent var(--barpx));
@@ -86,6 +92,13 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 }
 .overviewBlock.dragging{cursor:grabbing; opacity:1; box-shadow:0 0 0 2px #fff;}
 #playheadOverview{position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none;}
+/* the flag is a separate element (see #playheadOverviewFlag) kept pinned to the visible scroll
+   position via JS, rather than a pseudo-element anchored to the (possibly scrolled-away) top of #playheadOverview */
+#playheadOverviewFlag{
+  position:absolute; width:14px; height:13px; background:#fff; z-index:7; pointer-events:none;
+  clip-path:polygon(0% 0%, 100% 0%, 100% 55%, 50% 100%, 0% 55%);
+  box-shadow:0 0 4px rgba(255,255,255,.7);
+}
 
 /* ===== INSTRUMENT EDITOR ===== */
 #instEditor{
@@ -129,7 +142,7 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
 }
 #playheadOverview{cursor:ew-resize;}
 #loopBar{
-  position:sticky; top:0; left:0; height:12px; z-index:6; background:var(--bg1); border-bottom:1px solid var(--line);
+  position:sticky; top:0; height:12px; z-index:6; background:var(--bg1); border-bottom:1px solid var(--line);
 }
 #loopRegion{
   position:absolute; top:0; height:100%; background:rgba(111,168,255,.35); border-left:2px solid var(--accent2); border-right:2px solid var(--accent2);
@@ -230,6 +243,7 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
 <!-- ================= ARRANGE / TRACK OVERVIEW ================= -->
 <div id="arrange">
   <div id="trackListCol">
+    <div id="trackListHeaderSpacer"></div>
     <div id="trackList"></div>
     <button id="addTrackBtn">+ Add Instrument Track</button>
   </div>
@@ -296,7 +310,7 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
 </div>
 <div id="rollFooter">
   <span id="footerLeft">Click a cell to add a note &middot; drag to select &middot; Ctrl+C / Ctrl+V to copy &middot; Del to remove &middot; Ctrl+Z / Ctrl+Shift+Z to undo/redo</span>
-  <div id="zoomControl"><span>Zoom</span><input type="range" id="zoomSlider" min="10" max="70" value="26"></div>
+  <div id="zoomControl"><span>Zoom</span><input type="range" id="zoomSlider" min="5" max="70" value="26"></div>
 </div>
 
 <div id="dragTooltip"></div>
@@ -313,8 +327,9 @@ const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const OCT_MIN = 0, OCT_MAX = 7;
 const ROW_H = 18;
 let STEP_W = 26;
-const STEP_W_MIN = 10, STEP_W_MAX = 70;
-const STEPS_TOTAL = 256; // 16th-note steps available on the grid (~16 bars @4/4)
+const STEP_W_MIN = 5, STEP_W_MAX = 70;
+const STEPS_TOTAL_BASE = 256; // 16th-note steps available on the grid (~16 bars @4/4)
+let STEPS_TOTAL = STEPS_TOTAL_BASE; // grows automatically as content extends past the current end
 const SCALES = {
   Major:[0,2,4,5,7,9,11], Minor:[0,2,3,5,7,8,10], Dorian:[0,2,3,5,7,9,10],
   Phrygian:[0,1,3,5,7,8,10], Lydian:[0,2,4,6,7,9,11], Mixolydian:[0,2,4,5,7,9,10],
@@ -347,7 +362,7 @@ function defaultInstrument(){
 }
 function makeTrack(name, colorIdx){
   return { id: nextTrackId++, name: name||("Track "+nextTrackId), color: TRACK_COLORS[colorIdx % TRACK_COLORS.length],
-           instrument: defaultInstrument(), notes: [], muted:false, solo:false, volume:0.8 };
+           instrument: defaultInstrument(), notes: [], muted:false, solo:false, volume:0.8, regions:null };
 }
 
 /* ======================================================================
@@ -361,7 +376,8 @@ function snapshotTracks(){
     tracks: state.tracks.map(t=>({
       id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume,
       instrument: Object.assign({}, t.instrument),
-      notes: t.notes.map(n=>({...n}))
+      notes: t.notes.map(n=>({...n})),
+      regions: t.regions ? t.regions.map(r=>({...r})) : null
     }))
   };
 }
@@ -378,7 +394,8 @@ function restoreSnapshot(snap){
   state.selectedTrackId = snap.selectedTrackId;
   state.tracks = snap.tracks.map(t=>{
     const track = { id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume,
-      instrument: Object.assign({}, t.instrument), notes: t.notes.map(n=>({...n})) };
+      instrument: Object.assign({}, t.instrument), notes: t.notes.map(n=>({...n})),
+      regions: t.regions ? t.regions.map(r=>({...r})) : null };
     nextTrackId = Math.max(nextTrackId, track.id+1);
     track.notes.forEach(n=>{ nextNoteId = Math.max(nextNoteId, n.id+1); });
     buildChain(track);
@@ -386,6 +403,7 @@ function restoreSnapshot(snap){
   });
   selectedNoteIds.clear();
   renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+  recomputeStepsTotal();
 }
 function undo(){
   if(!undoStack.length){ toast("Nothing to undo"); return; }
@@ -561,6 +579,18 @@ function renderPlayheads(){
   const x = step*STEP_W;
   document.getElementById("playhead").style.left = x+"px";
   document.getElementById("playheadOverview").style.left = (step/stepsPerBar()*BAR_PX) +"px";
+  positionOverviewFlag();
+}
+
+// keeps the little playhead flag pinned to whatever row is currently scrolled to the top of the
+// arrange view (like the ruler), instead of staying anchored to the top of the full scrollable content
+function positionOverviewFlag(){
+  const flag = document.getElementById("playheadOverviewFlag");
+  const tc = document.getElementById("timelineCol");
+  if(!flag || !tc) return;
+  const step = currentPlayStep();
+  flag.style.left = (step/stepsPerBar()*BAR_PX - 6) + "px";
+  flag.style.top = tc.scrollTop + "px";
 }
 
 /* ======================================================================
@@ -637,6 +667,34 @@ function sizeGrid(){
   noteLayer.style.width=w+"px"; noteLayer.style.height=h+"px";
   drawGridLines();
   renderLoopUI();
+}
+
+// grow the timeline (grid + ruler) to keep some empty room past whatever the furthest note/track content reaches —
+// never shrinks back on its own, so the ruler/grid never "run out" as parts extend beyond the original 16 bars
+// if a track has been split into regions, make sure a newly-added note always falls inside one —
+// growing the nearest region to cover it rather than leaving the note invisible in the overview
+function extendRegionsForNote(track, note){
+  if(!track.regions || !track.regions.length) return;
+  if(track.regions.some(r=> note.step>=r.start && note.step<r.end)) return;
+  let nearest = track.regions[0], nearestDist = Infinity;
+  track.regions.forEach(r=>{
+    const mid = (r.start+r.end)/2, dist = Math.abs(note.step-mid);
+    if(dist<nearestDist){ nearestDist=dist; nearest=r; }
+  });
+  if(note.step < nearest.start) nearest.start = note.step;
+  if(note.step+note.dur > nearest.end) nearest.end = note.step+note.dur;
+}
+
+function recomputeStepsTotal(){
+  let maxEnd = STEPS_TOTAL_BASE;
+  state.tracks.forEach(t=> t.notes.forEach(n=>{ maxEnd = Math.max(maxEnd, n.step+n.dur); }));
+  const spb = stepsPerBar();
+  const needed = Math.ceil(maxEnd/spb)*spb + spb*4;
+  if(needed > STEPS_TOTAL){
+    STEPS_TOTAL = needed;
+    sizeGrid();
+    buildOverview();
+  }
 }
 
 // zoom the tile grid horizontally (trackpad pinch or the zoom slider), keeping the view centered on the same step
@@ -740,55 +798,104 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
 function buildOverview(){
   const inner = document.getElementById("timelineInner");
   inner.innerHTML = "";
+  const ruler = document.createElement("div"); ruler.id="arrangeRuler"; inner.appendChild(ruler);
   const ph = document.createElement("div"); ph.id="playheadOverview"; inner.appendChild(ph);
+  const flag = document.createElement("div"); flag.id="playheadOverviewFlag"; inner.appendChild(flag);
   state.tracks.forEach(track=>{
     const row = document.createElement("div");
     row.className="timelineRow"; row.style.setProperty("--barpx",BAR_PX+"px");
     row.dataset.id = track.id;
-    if(track.notes.length){
+    if(track.regions && track.regions.length){
+      // split into independent regions: each renders as its own block, but all still belong to this one track
+      track.regions.forEach(region=>{
+        const regionNotes = track.notes.filter(n=> n.step>=region.start && n.step<region.end);
+        renderTrackBlock(row, track, region.start, region.end, regionNotes, region.id);
+      });
+    } else if(track.notes.length){
       const spb = stepsPerBar();
       const minStep = Math.min(...track.notes.map(n=>n.step));
       const maxStep = Math.max(...track.notes.map(n=>n.step+n.dur));
-      const startBar = Math.floor(minStep/spb), endBar = Math.ceil(maxStep/spb);
-      const blockW = Math.max(20,(endBar-startBar)*BAR_PX-3);
-      const block = document.createElement("div");
-      block.className="overviewBlock";
-      block.style.left=(startBar*BAR_PX)+"px";
-      block.style.width=blockW+"px";
-      block.style.background = track.color;
-      block.style.color = "#111";
-
-      const pattern = document.createElement("canvas");
-      const blockH = 34, dpr = window.devicePixelRatio||1;
-      pattern.width = blockW*dpr; pattern.height = blockH*dpr;
-      pattern.style.position="absolute"; pattern.style.left="0"; pattern.style.top="0";
-      pattern.style.width=blockW+"px"; pattern.style.height=blockH+"px"; pattern.style.zIndex="0";
-      const pctx = pattern.getContext("2d"); pctx.scale(dpr,dpr);
-      const totalSteps = (endBar-startBar)*spb;
-      const pitches = track.notes.map(n=>n.pitch);
-      const minP = Math.min(...pitches), maxP = Math.max(...pitches);
-      const range = Math.max(1, maxP-minP);
-      pctx.fillStyle = "rgba(0,0,0,.55)";
-      track.notes.forEach(n=>{
-        const nx = (n.step-startBar*spb)/totalSteps*blockW;
-        const nw = Math.max(1, n.dur/totalSteps*blockW-0.5);
-        const t = (n.pitch-minP)/range;
-        const ny = (blockH-6) - t*(blockH-12);
-        pctx.fillRect(nx, ny, nw, 2);
-      });
-      block.appendChild(pattern);
-
-      const label = document.createElement("span");
-      label.textContent = track.name;
-      label.style.position="relative"; label.style.zIndex="1"; label.style.pointerEvents="none";
-      block.appendChild(label);
-
-      row.appendChild(block);
+      const startBar = Math.floor(minStep/spb)*spb, endBar = Math.ceil(maxStep/spb)*spb;
+      renderTrackBlock(row, track, startBar, endBar, track.notes, null);
     }
     inner.appendChild(row);
   });
-  inner.style.width = (STEPS_TOTAL/stepsPerBar()*BAR_PX+40)+"px";
+  const totalW = (STEPS_TOTAL/stepsPerBar()*BAR_PX+40);
+  inner.style.width = totalW+"px";
+  renderArrangeRuler(totalW);
   renderPlayheads();
+}
+
+// renders one overview block spanning [startStep,endStep) in a track's timeline row, with a mini note-pattern preview
+function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
+  const spb = stepsPerBar();
+  const left = startStep/spb*BAR_PX;
+  const blockW = Math.max(20, (endStep-startStep)/spb*BAR_PX - 3);
+  const block = document.createElement("div");
+  block.className = "overviewBlock";
+  block.style.left = left+"px";
+  block.style.width = blockW+"px";
+  block.style.background = track.color;
+  block.style.color = "#111";
+  if(regionId!=null) block.dataset.regionId = regionId;
+
+  const pattern = document.createElement("canvas");
+  const blockH = 34, dpr = window.devicePixelRatio||1;
+  pattern.width = blockW*dpr; pattern.height = blockH*dpr;
+  pattern.style.position="absolute"; pattern.style.left="0"; pattern.style.top="0";
+  pattern.style.width=blockW+"px"; pattern.style.height=blockH+"px"; pattern.style.zIndex="0";
+  const pctx = pattern.getContext("2d"); pctx.scale(dpr,dpr);
+  if(notes.length){
+    const totalSteps = Math.max(1, endStep-startStep);
+    const pitches = notes.map(n=>n.pitch);
+    const minP = Math.min(...pitches), maxP = Math.max(...pitches);
+    const range = Math.max(1, maxP-minP);
+    pctx.fillStyle = "rgba(0,0,0,.55)";
+    notes.forEach(n=>{
+      const nx = (n.step-startStep)/totalSteps*blockW;
+      const nw = Math.max(1, n.dur/totalSteps*blockW-0.5);
+      const t = (n.pitch-minP)/range;
+      const ny = (blockH-6) - t*(blockH-12);
+      pctx.fillRect(nx, ny, nw, 2);
+    });
+  }
+  block.appendChild(pattern);
+
+  const label = document.createElement("span");
+  label.textContent = track.name;
+  label.style.position="relative"; label.style.zIndex="1"; label.style.pointerEvents="none";
+  block.appendChild(label);
+
+  row.appendChild(block);
+}
+
+// bar-number ruler above the arrange timeline, marking measure boundaries
+function renderArrangeRuler(totalW){
+  const ruler = document.getElementById("arrangeRuler");
+  if(!ruler) return;
+  const h = 18, dpr = window.devicePixelRatio||1;
+  const canvas = document.createElement("canvas");
+  canvas.width = totalW*dpr; canvas.height = h*dpr;
+  canvas.style.width = totalW+"px"; canvas.style.height = h+"px";
+  ruler.innerHTML = ""; ruler.appendChild(canvas);
+  const ctx = canvas.getContext("2d"); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,totalW,h);
+  const spb = stepsPerBar(), beats = beatsPerBar();
+  const totalBars = Math.ceil(STEPS_TOTAL/spb);
+  ctx.font = "10px -apple-system,BlinkMacSystemFont,sans-serif";
+  ctx.textBaseline = "top";
+  for(let bar=0; bar<totalBars; bar++){
+    const x = bar*BAR_PX;
+    ctx.strokeStyle = "#5a5a68"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x+.5, 0); ctx.lineTo(x+.5, h); ctx.stroke();
+    ctx.fillStyle = "#b7b7c2";
+    ctx.fillText(String(bar+1), x+4, 2);
+    ctx.strokeStyle = "#3a3a44";
+    for(let b=1; b<beats; b++){
+      const bx = x + b*(BAR_PX/beats);
+      ctx.beginPath(); ctx.moveTo(bx+.5, h*0.6); ctx.lineTo(bx+.5, h); ctx.stroke();
+    }
+  }
 }
 
 /* ======================================================================
@@ -883,26 +990,6 @@ function onGridMouseDown(e){
     return;
   }
 
-  const clickedNoteEl = e.target.closest(".note");
-
-  if(clickedNoteEl){
-    const id = Number(clickedNoteEl.dataset.id);
-    const clickedNote = track.notes.find(n=>n.id===id);
-    if(clickedNote && !state.playing) previewNote(track, clickedNote.pitch);
-    if(!selectedNoteIds.has(id)){
-      if(!e.shiftKey) selectedNoteIds.clear();
-      selectedNoteIds.add(id);
-      renderNotes();
-    } else if(e.shiftKey){
-      selectedNoteIds.delete(id); renderNotes(); return;
-    }
-    pushHistory();
-    const originNotes = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur}));
-    drag = {mode:"move", startStep:step, startMidiRow:row, origin:originNotes, moved:false};
-    e.preventDefault();
-    return;
-  }
-
   if(step<0||step>=STEPS_TOTAL||row<0||row>=TOTAL_ROWS) return;
 
   if(e.shiftKey || e.altKey){
@@ -915,13 +1002,21 @@ function onGridMouseDown(e){
     return;
   }
 
-  // click on an already-placed note's cell = remove it
-  const existing = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
-  if(existing){
+  // is there a note at this cell? Look it up by grid position (not by which DOM element the
+  // click happened to land on) so clicking anywhere on/near a tile always selects it — never deletes it.
+  const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
+  if(hitNote){
+    if(!state.playing) previewNote(track, hitNote.pitch);
+    if(!selectedNoteIds.has(hitNote.id)){
+      if(!e.shiftKey) selectedNoteIds.clear();
+      selectedNoteIds.add(hitNote.id);
+      renderNotes();
+    } else if(e.shiftKey){
+      selectedNoteIds.delete(hitNote.id); renderNotes(); return;
+    }
     pushHistory();
-    track.notes = track.notes.filter(n=>n.id!==existing.id);
-    selectedNoteIds.delete(existing.id);
-    renderNotes(); buildOverview();
+    const originNotes = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur}));
+    drag = {mode:"move", startStep:step, startMidiRow:row, origin:originNotes, moved:false};
     e.preventDefault();
     return;
   }
@@ -949,6 +1044,16 @@ window.addEventListener("mousemove", (e)=>{
       const delta = Math.round(stepAt-loopDrag.downStep);
       const newStart = Math.max(0, Math.min(STEPS_TOTAL-len, loopDrag.startStart+delta));
       state.loop.start = newStart; state.loop.end = newStart+len;
+    } else if(loopDrag.mode==="create"){
+      if(!loopDrag.dragged && Math.abs(e.clientX-loopDrag.downX)>3) loopDrag.dragged = true;
+      if(loopDrag.dragged){
+        const cur = Math.round(stepAt);
+        const s = Math.max(0, Math.min(loopDrag.startStep, cur));
+        const en = Math.min(STEPS_TOTAL, Math.max(loopDrag.startStep, cur)+1);
+        state.loop.start = s; state.loop.end = Math.max(s+1, en);
+        state.loop.enabled = true;
+        document.getElementById("loopBtn").classList.add("on");
+      }
     }
     renderLoopUI();
     return;
@@ -957,12 +1062,19 @@ window.addEventListener("mousemove", (e)=>{
     const track = state.tracks.find(t=>t.id===trackDrag.trackId);
     if(track){
       const deltaSteps = Math.round((e.clientX-trackDrag.startX)/BAR_PX*stepsPerBar());
-      const minOrigin = Math.min(...trackDrag.origin.map(o=>o.step));
-      const clampedDelta = Math.max(-minOrigin, deltaSteps);
+      const minOrigin = trackDrag.origin.length ? Math.min(...trackDrag.origin.map(o=>o.step)) : 0;
+      const lowerBound = Math.max(-minOrigin, trackDrag.minDelta);
+      const clampedDelta = Math.max(lowerBound, Math.min(trackDrag.maxDelta, deltaSteps));
       trackDrag.origin.forEach(o=>{
         const n = track.notes.find(x=>x.id===o.id); if(!n) return;
         n.step = o.step+clampedDelta;
       });
+      if(trackDrag.originRegions && track.regions){
+        trackDrag.originRegions.forEach(o=>{
+          const r = track.regions.find(x=>x.id===o.id); if(!r) return;
+          r.start = Math.max(0, o.start+clampedDelta); r.end = Math.max(r.start+1, o.end+clampedDelta);
+        });
+      }
       if(track.id===state.selectedTrackId) renderNotes();
       buildOverview();
     }
@@ -1028,7 +1140,9 @@ window.addEventListener("mousemove", (e)=>{
       const dur = noteOverlapMaxDur(track, drag.row, drag.startStep, desiredDur, drag.noteId);
       if(drag.noteId==null){
         drag.noteId = nextNoteId++;
-        track.notes.push({id:drag.noteId, step:drag.startStep, pitch:drag.pitch, dur});
+        const newNote = {id:drag.noteId, step:drag.startStep, pitch:drag.pitch, dur};
+        track.notes.push(newNote);
+        extendRegionsForNote(track, newNote);
         previewNote(track, drag.pitch);
       } else {
         const n = track.notes.find(nn=>nn.id===drag.noteId);
@@ -1042,7 +1156,7 @@ window.addEventListener("mousemove", (e)=>{
 window.addEventListener("mouseup", ()=>{
   endHistoryGesture();
   if(loopDrag){ loopDrag=null; return; }
-  if(trackDrag){ trackDrag=null; document.body.style.cursor=""; return; }
+  if(trackDrag){ trackDrag=null; document.body.style.cursor=""; recomputeStepsTotal(); return; }
   if(playheadDrag){
     if(playheadDrag.type==="overview") suppressTimelineClick = true;
     playheadDrag=null;
@@ -1050,17 +1164,20 @@ window.addEventListener("mouseup", ()=>{
   }
   if(drag){
     if(drag.mode==="select") document.getElementById("selectionBox").style.display="none";
-    if(drag.mode==="move" && drag.moved){ buildOverview(); }
+    if(drag.mode==="move" && drag.moved){ buildOverview(); recomputeStepsTotal(); }
     if(drag.mode==="place"){
       const track = selectedTrack();
       if(track){
         if(!drag.dragged){
           const dur = noteOverlapMaxDur(track, drag.row, drag.startStep, state.noteLenSteps, null);
-          track.notes.push({id: nextNoteId++, step:drag.startStep, pitch:drag.pitch, dur});
+          const newNote = {id: nextNoteId++, step:drag.startStep, pitch:drag.pitch, dur};
+          track.notes.push(newNote);
+          extendRegionsForNote(track, newNote);
           if(!state.playing) previewNote(track, drag.pitch);
           renderNotes();
         }
         buildOverview();
+        recomputeStepsTotal();
       }
     }
   }
@@ -1086,15 +1203,25 @@ document.addEventListener("keydown", (e)=>{
     e.preventDefault(); redo(); return;
   }
 
-  if(editContext==="track" && (e.ctrlKey||e.metaKey) && (e.key.toLowerCase()==="c"||e.key.toLowerCase()==="v")){
+  if(editContext==="track" && (e.ctrlKey||e.metaKey) && (e.key.toLowerCase()==="c"||e.key.toLowerCase()==="v"||e.key.toLowerCase()==="x")){
     const track = selectedTrack();
-    if(e.key.toLowerCase()==="c"){
+    const k = e.key.toLowerCase();
+    if(k==="c" || k==="x"){
       if(!track) return;
       state.trackClipboard = {
         name:track.name, color:track.color, instrument:Object.assign({},track.instrument),
-        volume:track.volume, notes: track.notes.map(n=>({step:n.step,pitch:n.pitch,dur:n.dur}))
+        volume:track.volume, notes: track.notes.map(n=>({step:n.step,pitch:n.pitch,dur:n.dur})),
+        regions: track.regions ? track.regions.map(r=>({start:r.start,end:r.end})) : null
       };
-      toast("Copied track \""+track.name+"\"");
+      if(k==="x"){
+        pushHistory();
+        state.tracks = state.tracks.filter(t=>t.id!==track.id);
+        state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
+        renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+        toast("Cut track \""+track.name+"\"");
+      } else {
+        toast("Copied track \""+track.name+"\"");
+      }
     } else {
       if(!state.trackClipboard) return;
       pushHistory();
@@ -1103,9 +1230,11 @@ document.addEventListener("keydown", (e)=>{
       newTrack.instrument = Object.assign({}, c.instrument);
       newTrack.volume = c.volume;
       newTrack.notes = c.notes.map(n=>({...n, id: nextNoteId++}));
+      newTrack.regions = c.regions ? c.regions.map(r=>({id: nextNoteId++, start:r.start, end:r.end})) : null;
       buildChain(newTrack);
       state.tracks.push(newTrack);
       selectTrack(newTrack.id);
+      recomputeStepsTotal();
       toast("Pasted track \""+newTrack.name+"\"");
     }
     e.preventDefault();
@@ -1118,6 +1247,15 @@ document.addEventListener("keydown", (e)=>{
     state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur}));
     if(state.clipboard.length) toast("Copied "+state.clipboard.length+" note(s)");
     e.preventDefault();
+  } else if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="x"){
+    if(!selectedNoteIds.size) return;
+    pushHistory();
+    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur}));
+    track.notes = track.notes.filter(n=>!selectedNoteIds.has(n.id));
+    selectedNoteIds.clear();
+    renderNotes(); buildOverview();
+    toast("Cut "+state.clipboard.length+" note(s)");
+    e.preventDefault();
   } else if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="v"){
     if(!state.clipboard.length) return;
     pushHistory();
@@ -1126,11 +1264,13 @@ document.addEventListener("keydown", (e)=>{
     const newIds = [];
     state.clipboard.forEach(n=>{
       const id = nextNoteId++;
-      track.notes.push({id, step: pasteAt+(n.step-minStep), pitch:n.pitch, dur:n.dur});
+      const newNote = {id, step: pasteAt+(n.step-minStep), pitch:n.pitch, dur:n.dur};
+      track.notes.push(newNote);
+      extendRegionsForNote(track, newNote);
       newIds.push(id);
     });
     selectedNoteIds = new Set(newIds);
-    renderNotes(); buildOverview();
+    renderNotes(); buildOverview(); recomputeStepsTotal();
     toast("Pasted "+newIds.length+" note(s) at step "+pasteAt);
     e.preventDefault();
   } else if(e.key==="Delete" || e.key==="Backspace"){
@@ -1169,10 +1309,9 @@ document.addEventListener("keydown", (e)=>{
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const s = n.step+1, r = midiToRow(n.pitch);
-      if(s+n.dur>STEPS_TOTAL) return;
       if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && s<o.step+o.dur && s+n.dur>o.step)) n.step=s;
     });
-    renderNotes(); buildOverview(); e.preventDefault();
+    renderNotes(); buildOverview(); recomputeStepsTotal(); e.preventDefault();
   } else if(e.code==="Space"){
     e.preventDefault();
     state.playing? stopPlayback(false) : startPlayback();
@@ -1219,12 +1358,10 @@ document.getElementById("loopRegion").addEventListener("mousedown",(e)=>{
 document.getElementById("loopBar").addEventListener("mousedown",(e)=>{
   if(e.target.id!=="loopBar") return; // background click only, not the region/handles
   const rect = gridInner.getBoundingClientRect();
-  const step = Math.max(0, Math.round((e.clientX-rect.left)/STEP_W));
-  state.loop.start = step; state.loop.end = Math.min(STEPS_TOTAL, step+stepsPerBar());
-  state.loop.enabled = true;
-  document.getElementById("loopBtn").classList.add("on");
-  renderLoopUI();
-  loopDrag = {mode:"resizeR"};
+  const startStep = Math.max(0, Math.round((e.clientX-rect.left)/STEP_W));
+  // only redefine the loop once the user actually drags — a bare click on empty ruler space
+  // shouldn't collapse/replace whatever loop region is already set
+  loopDrag = {mode:"create", downX:e.clientX, startStep, dragged:false};
   e.preventDefault();
 });
 document.getElementById("loopBtn").addEventListener("click",()=>{
@@ -1297,18 +1434,57 @@ document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
     selectTrack(trackId);
     pushHistory();
     document.body.style.cursor = "grabbing";
-    trackDrag = {trackId, startX:e.clientX, origin: track.notes.map(n=>({id:n.id, step:n.step}))};
+    const regionId = blockEl.dataset.regionId!=null ? Number(blockEl.dataset.regionId) : null;
+    if(regionId!=null){
+      // dragging one split-off region: only its own notes move, clamped so it can't cross into a neighboring region
+      const idx = track.regions.findIndex(r=>r.id===regionId);
+      const region = track.regions[idx];
+      const prevRegion = track.regions[idx-1], nextRegion = track.regions[idx+1];
+      const minDelta = (prevRegion? prevRegion.end : 0) - region.start;
+      const maxDelta = nextRegion? (nextRegion.start - region.end) : Infinity;
+      trackDrag = {
+        trackId, startX:e.clientX, minDelta, maxDelta,
+        origin: track.notes.filter(n=> n.step>=region.start && n.step<region.end).map(n=>({id:n.id, step:n.step})),
+        originRegions: [{id:region.id, start:region.start, end:region.end}]
+      };
+    } else {
+      // un-split track: the whole thing (all notes) drags together, as before
+      trackDrag = {
+        trackId, startX:e.clientX, minDelta:-Infinity, maxDelta:Infinity,
+        origin: track.notes.map(n=>({id:n.id, step:n.step})),
+        originRegions: track.regions ? track.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null
+      };
+    }
     e.preventDefault(); e.stopPropagation();
     return;
   }
   const rect = document.getElementById("timelineInner").getBoundingClientRect();
   const x = e.clientX-rect.left;
   const phX = currentPlayStep()/stepsPerBar()*BAR_PX;
-  if(Math.abs(x-phX)<=6){
+  if(Math.abs(x-phX)<=8){
     if(state.playing) stopPlayback(false);
     playheadDrag = {type:"overview"};
     e.preventDefault(); e.stopPropagation();
   }
+});
+
+// keep the track list and the arrange timeline scrolling together vertically
+const trackListCol = document.getElementById("trackListCol");
+const timelineCol = document.getElementById("timelineCol");
+let syncingArrangeScroll = false;
+trackListCol.addEventListener("scroll", ()=>{
+  if(syncingArrangeScroll) return;
+  syncingArrangeScroll = true;
+  timelineCol.scrollTop = trackListCol.scrollTop;
+  syncingArrangeScroll = false;
+  positionOverviewFlag();
+});
+timelineCol.addEventListener("scroll", ()=>{
+  if(syncingArrangeScroll) return;
+  syncingArrangeScroll = true;
+  trackListCol.scrollTop = timelineCol.scrollTop;
+  syncingArrangeScroll = false;
+  positionOverviewFlag();
 });
 document.getElementById("timelineCol").addEventListener("dblclick",(e)=>{
   const rect = document.getElementById("timelineInner").getBoundingClientRect();
@@ -1325,20 +1501,27 @@ document.getElementById("deleteTrackBtn").addEventListener("click", deleteSelect
 document.getElementById("splitBtn").addEventListener("click", ()=>{
   const track = selectedTrack(); if(!track) return;
   if(!track.notes.length){ toast("\""+track.name+"\" has no notes to split"); return; }
-  pushHistory();
   const splitStep = Math.round(currentPlayStep());
-  const before = track.notes.filter(n=>n.step<splitStep);
-  const after = track.notes.filter(n=>n.step>=splitStep);
-  track.notes = before;
-  const newTrack = makeTrack(track.name+" (2)", state.tracks.length);
-  newTrack.instrument = JSON.parse(JSON.stringify(track.instrument));
-  newTrack.instrument.customBuffer = track.instrument.customBuffer; // keep buffer ref (not serializable via JSON)
-  newTrack.volume = track.volume;
-  newTrack.notes = after.map(n=>({...n, id: nextNoteId++}));
-  buildChain(newTrack);
-  state.tracks.push(newTrack);
+  const spb = stepsPerBar();
+  pushHistory();
+  // first split ever on this track: establish its single region from the current note span
+  if(!track.regions || !track.regions.length){
+    const minStep = Math.min(...track.notes.map(n=>n.step));
+    const maxStep = Math.max(...track.notes.map(n=>n.step+n.dur));
+    track.regions = [{id: nextNoteId++, start: Math.floor(minStep/spb)*spb, end: Math.ceil(maxStep/spb)*spb}];
+  }
+  const idx = track.regions.findIndex(r=> splitStep>r.start && splitStep<r.end);
+  if(idx===-1){
+    undoStack.pop(); // nothing actually changed — drop the checkpoint we just pushed
+    toast("Playhead must be inside a region of \""+track.name+"\" to split it");
+    return;
+  }
+  const region = track.regions[idx];
+  const left = {id: nextNoteId++, start:region.start, end:splitStep};
+  const right = {id: nextNoteId++, start:splitStep, end:region.end};
+  track.regions.splice(idx, 1, left, right);
   renderTrackList(); buildOverview(); renderNotes();
-  toast("Split \""+track.name+"\" into two tracks at step "+splitStep);
+  toast("Split \""+track.name+"\" at step "+splitStep);
 });
 
 /* ======================================================================
@@ -1426,7 +1609,8 @@ function serializeProject(){
       instrument: { wave:t.instrument.wave, volume:t.instrument.volume, attack:t.instrument.attack,
         release:t.instrument.release, eqLow:t.instrument.eqLow, eqMid:t.instrument.eqMid,
         eqHigh:t.instrument.eqHigh, reverb:t.instrument.reverb, customBaseMidi:t.instrument.customBaseMidi },
-      notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur}))
+      notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur})),
+      regions: t.regions ? t.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null
     }))
   };
 }
@@ -1452,6 +1636,7 @@ document.getElementById("loadInput").addEventListener("change",(e)=>{
   e.target.value="";
 });
 function loadProject(data){
+  STEPS_TOTAL = STEPS_TOTAL_BASE;
   state.bpm=data.bpm||120; state.timeSig=data.timeSig||[4,4]; state.key=data.key||"C"; state.mode=data.mode||"Major";
   state.octaveFocus=data.octaveFocus||4; state.noteLenSteps=data.noteLenSteps||4;
   document.getElementById("bpmInput").value=state.bpm;
@@ -1466,6 +1651,7 @@ function loadProject(data){
     track.color = t.color||track.color; track.muted=!!t.muted; track.solo=!!t.solo; track.volume = t.volume??0.8;
     track.instrument = Object.assign(defaultInstrument(), t.instrument||{});
     track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur}; });
+    track.regions = (t.regions||null) && t.regions.map(r=>{ nextNoteId=Math.max(nextNoteId, (r.id||0)+1); return {id:r.id||nextNoteId++, start:r.start, end:r.end}; });
     buildChain(track);
     return track;
   });
@@ -1473,13 +1659,15 @@ function loadProject(data){
   selectedNoteIds.clear();
   undoStack=[]; redoStack=[];
   state.loop = {enabled:false, start:0, end:stepsPerBar()};
-  buildPianoLabels(); drawGridLines();
+  sizeGrid(); buildPianoLabels(); drawGridLines();
   renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+  recomputeStepsTotal();
   document.getElementById("loopBtn").classList.remove("on");
 }
 document.getElementById("newBtn").addEventListener("click", ()=>{
   if(!confirm("Start a new project? Unsaved changes will be lost.")) return;
   stopPlayback(true);
+  STEPS_TOTAL = STEPS_TOTAL_BASE;
   state.tracks=[]; state.selectedTrackId=null; selectedNoteIds.clear();
   undoStack=[]; redoStack=[];
   initDefaultProject();
