@@ -12,7 +12,7 @@
   --accent:#5ee6a8; --accent2:#6fa8ff; --accent3:#ff9d6f;
   --danger:#ff6b6b; --warn:#ffd166;
   --row-a:#1b1b21; --row-b:#202027; --row-c:#25252d;
-  --row-light:#2c2c34; --row-dark:#1c1c22;
+  --row-light:#2c2c34; --row-dark:#1c1c22; --row-c:rgba(94,230,168,.18);
 }
 *{box-sizing:border-box;}
 html,body{height:100%;}
@@ -140,14 +140,14 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
   box-shadow:0 1px 2px rgba(0,0,0,.4);
 }
 .note.selected{outline:2px solid #fff; z-index:3;}
-.note.bend{border-style:dashed;}
 .bendHandle{position:absolute; right:-3px; top:0; width:7px; height:100%; cursor:crosshair; z-index:4;}
 .note:hover .bendHandle{background:rgba(255,255,255,.3); border-radius:2px;}
-.bendLabel{
-  position:absolute; left:100%; top:0; height:100%; margin-left:5px; display:flex; align-items:center;
-  font-size:9px; font-weight:600; color:#fff; white-space:nowrap; pointer-events:none; z-index:5;
-  text-shadow:0 1px 2px rgba(0,0,0,.9), 0 0 3px rgba(0,0,0,.7);
+.bendStub{
+  position:absolute; border-radius:3px; opacity:.85; cursor:ns-resize; z-index:2;
+  border:1px solid rgba(0,0,0,.4);
 }
+.bendStub:hover{opacity:1; box-shadow:0 0 0 1px #fff;}
+.bendSlide{position:absolute; pointer-events:none; z-index:1; opacity:.6; overflow:visible;}
 #selectionBox{
   position:absolute; border:1px solid var(--accent2); background:rgba(111,168,255,.15); z-index:4; pointer-events:none; display:none;
 }
@@ -678,7 +678,7 @@ function buildPianoLabels(){
     div.textContent = name==="C" ? ("C"+oct) : name.replace("#","♯");
     div.dataset.midi = midi;
     const isNatural = name.indexOf("#")===-1;
-    div.style.background = isNatural ? "var(--row-light)" : "var(--row-dark)";
+    div.style.background = name==="C" ? "var(--row-c)" : (isNatural ? "var(--row-light)" : "var(--row-dark)");
     inner.appendChild(div);
   }
 }
@@ -754,7 +754,7 @@ function drawGridLines(){
     const midi = rowToMidi(row);
     const name = NOTE_NAMES[((midi%12)+12)%12];
     const isNatural = name.indexOf("#")===-1;
-    ctx.fillStyle = isNatural ? "#2c2c34" : "#1c1c22";
+    ctx.fillStyle = name==="C" ? "rgba(94,230,168,.18)" : (isNatural ? "#2c2c34" : "#1c1c22");
     ctx.fillRect(0,row*ROW_H,w,ROW_H);
   }
   // horizontal separators
@@ -789,21 +789,53 @@ function renderNotes(){
     div.style.width=(note.dur*STEP_W-2)+"px";
     div.style.height=(ROW_H-2)+"px";
     div.style.background = hasBend
-      ? "linear-gradient(to right, "+track.color+", "+(note.bendTo<note.pitch? "#6fa8ff":"#ff9d6f")+")"
+      ? "linear-gradient(to right, "+track.color+", var(--accent2))"
       : track.color;
     div.dataset.id = note.id;
     div.title = hasBend ? "Slurred: "+midiToName(note.pitch)+" → "+midiToName(note.bendTo) : midiToName(note.pitch);
-    if(hasBend){
-      const label = document.createElement("span");
-      label.className = "bendLabel";
-      label.textContent = "→ "+midiToName(note.bendTo);
-      div.appendChild(label);
-    }
     const grip = document.createElement("div");
     grip.className = "bendHandle";
     grip.title = "Drag sideways to resize, up/down to slur/tie into another pitch";
     div.appendChild(grip);
     noteLayer.appendChild(div);
+
+    if(hasBend){
+      const destRow = midiToRow(note.bendTo);
+      const stubW = STEP_W-2;
+      const stubLeft = note.step*STEP_W + note.dur*STEP_W - stubW + 1;
+      const stub = document.createElement("div");
+      stub.className = "bendStub";
+      stub.dataset.id = note.id;
+      stub.title = "Drag up/down to change the slur target";
+      stub.style.left = stubLeft+"px";
+      stub.style.width = stubW+"px";
+      stub.style.top = (destRow*ROW_H + 1)+"px";
+      stub.style.height = (ROW_H-2)+"px";
+      stub.style.background = "var(--accent2)";
+      noteLayer.appendChild(stub);
+
+      // the slide is drawn from the note's left edge (rather than the resize handle on the right)
+      // so it reads as a glissando sweeping across the tile toward the slur target, independent of
+      // whatever's happening at the right-edge resize handle
+      const svgNS = "http://www.w3.org/2000/svg";
+      const x1 = note.step*STEP_W+1, y1 = row*ROW_H+ROW_H/2;
+      const x2 = stubLeft+(stubW-2)/2, y2 = destRow*ROW_H+ROW_H/2;
+      const left = Math.min(x1,x2), top = Math.min(y1,y2);
+      const w = Math.max(1,Math.abs(x2-x1)), h = Math.max(1,Math.abs(y2-y1));
+      const svg = document.createElementNS(svgNS,"svg");
+      svg.setAttribute("class","bendSlide");
+      svg.style.left=left+"px"; svg.style.top=top+"px"; svg.style.width=w+"px"; svg.style.height=h+"px";
+      svg.setAttribute("viewBox", "0 0 "+w+" "+h);
+      const path = document.createElementNS(svgNS,"path");
+      const lx1=x1-left, ly1=y1-top, lx2=x2-left, ly2=y2-top;
+      path.setAttribute("d", "M"+lx1+","+ly1+" Q"+((lx1+lx2)/2)+","+ly2+" "+lx2+","+ly2);
+      path.setAttribute("stroke","var(--accent2)");
+      path.setAttribute("stroke-width","2");
+      path.setAttribute("fill","none");
+      path.setAttribute("stroke-linecap","round");
+      svg.appendChild(path);
+      noteLayer.appendChild(svg);
+    }
   });
 }
 
@@ -882,11 +914,12 @@ function buildOverview(){
 function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
   const spb = stepsPerBar();
   const left = startStep/spb*BAR_PX;
-  const blockW = Math.max(20, (endStep-startStep)/spb*BAR_PX - 3);
+  const blockW = Math.max(20, (endStep-startStep)/spb*BAR_PX);
   const block = document.createElement("div");
   block.className = "overviewBlock"+(regionId!=null && selectedRegionIds.has(regionId) ? " regionSelected" : "");
   block.style.left = left+"px";
   block.style.width = blockW+"px";
+  block.style.boxSizing = "border-box";
   block.style.background = track.color;
   block.style.color = "#111";
   if(regionId!=null) block.dataset.regionId = regionId;
@@ -1056,7 +1089,9 @@ function onGridMouseDown(e){
   const track = selectedTrack(); if(!track) return;
   editContext = "notes";
 
-  // the little grip on a tile's right edge: drag sideways to resize, up/down to slur/tie into another pitch
+  // the little grip on a tile's right edge: drag sideways to resize, or (only if the note isn't already
+  // slurred) up/down to start a new slur — once a slur exists, its target is adjusted via the separate
+  // bendStub instead, so this handle stays dedicated to length once that stub appears
   if(e.target.classList && e.target.classList.contains("bendHandle")){
     const noteEl = e.target.closest(".note");
     const note = track.notes.find(n=>n.id===Number(noteEl.dataset.id));
@@ -1066,7 +1101,19 @@ function onGridMouseDown(e){
       // elsewhere on the grid), but that mapping only "engages" once the mouse has actually moved some
       // vertical distance — otherwise just touching the grip to resize horizontally would instantly
       // snap an existing slur back to the note's own pitch
-      drag = {mode:"bend", noteId:note.id, startClientY:e.clientY, bendEngaged:false};
+      drag = {mode:"bend", noteId:note.id, startClientY:e.clientY, bendEngaged:false, allowBend: note.bendTo==null};
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+  }
+
+  // the small stub on a slurred note: drag it up/down to retarget the slur pitch without touching
+  // the note's length (that stays the resize handle's job)
+  if(e.target.classList && e.target.classList.contains("bendStub")){
+    const note = track.notes.find(n=>n.id===Number(e.target.dataset.id));
+    if(note){
+      pushHistory();
+      drag = {mode:"bendAdjust", noteId:note.id};
       e.preventDefault(); e.stopPropagation();
       return;
     }
@@ -1264,21 +1311,36 @@ window.addEventListener("mousemove", (e)=>{
         extendRegionsForNote(track, note);
       }
 
-      // vertical movement sets the slur/tie target — the cursor's row maps straight to a pitch, 1:1
-      // with wherever notes actually sit on the grid, but that mapping only "engages" once the mouse
-      // has moved a few real pixels vertically, so a horizontal-only resize can't touch an existing slur
-      if(!drag.bendEngaged && Math.abs(e.clientY-drag.startClientY)>5) drag.bendEngaged = true;
-      if(drag.bendEngaged){
-        const clampedRow = Math.max(0, Math.min(TOTAL_ROWS-1, row));
-        const newPitch = rowToMidi(clampedRow);
-        if(newPitch !== (note.bendTo??note.pitch)){
-          note.bendTo = newPitch===note.pitch ? null : newPitch;
+      // vertical movement starts a new slur/tie target — only while the note has no slur yet, though:
+      // once a bendStub exists, this handle stays dedicated to length and the stub handles retargeting.
+      // the cursor's row maps straight to a pitch, 1:1 with wherever notes actually sit on the grid, but
+      // that mapping only "engages" once the mouse has moved a few real pixels vertically, so a
+      // horizontal-only resize can't accidentally start a slur
+      if(drag.allowBend){
+        if(!drag.bendEngaged && Math.abs(e.clientY-drag.startClientY)>5) drag.bendEngaged = true;
+        if(drag.bendEngaged){
+          const clampedRow = Math.max(0, Math.min(TOTAL_ROWS-1, row));
+          const newPitch = rowToMidi(clampedRow);
+          if(newPitch !== (note.bendTo??note.pitch)){
+            note.bendTo = newPitch===note.pitch ? null : newPitch;
+          }
         }
       }
 
       renderNotes();
       const lenText = note.dur+" step"+(note.dur===1?"":"s");
       showTooltip(e.clientX, e.clientY, note.bendTo!=null ? lenText+" · slur to "+midiToName(note.bendTo) : lenText);
+    }
+  } else if(drag.mode==="bendAdjust"){
+    const note = track.notes.find(n=>n.id===drag.noteId);
+    if(note){
+      const clampedRow = Math.max(0, Math.min(TOTAL_ROWS-1, row));
+      const newPitch = rowToMidi(clampedRow);
+      if(newPitch !== (note.bendTo??note.pitch)){
+        note.bendTo = newPitch===note.pitch ? null : newPitch;
+        renderNotes();
+      }
+      showTooltip(e.clientX, e.clientY, note.bendTo!=null ? "slur to "+midiToName(note.bendTo) : "slur removed");
     }
   }
 });
@@ -1309,7 +1371,7 @@ window.addEventListener("mouseup", ()=>{
         recomputeStepsTotal();
       }
     }
-    if(drag.mode==="bend"){ buildOverview(); recomputeStepsTotal(); }
+    if(drag.mode==="bend" || drag.mode==="bendAdjust"){ buildOverview(); recomputeStepsTotal(); }
   }
   drag=null; hideTooltip();
 });
