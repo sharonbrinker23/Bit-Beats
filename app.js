@@ -127,7 +127,7 @@ function makeReverbBuffer(seconds){
 }
 const reverbBuffer = makeReverbBuffer(2.2);
 
-// build (or rebuild) a track's persistent audio chain: input -> eq -> reverb send/dry -> master
+// build (or rebuild) a track's persistent audio chain: input -> eq -> reverb send/dry -> pan -> master
 function buildChain(track){
   const eqLow = actx.createBiquadFilter(); eqLow.type="lowshelf"; eqLow.frequency.value=320;
   const eqMid = actx.createBiquadFilter(); eqMid.type="peaking"; eqMid.frequency.value=1200; eqMid.Q.value=0.9;
@@ -136,11 +136,12 @@ function buildChain(track){
   const dry = actx.createGain(), wet = actx.createGain();
   const conv = actx.createConvolver(); conv.buffer = reverbBuffer;
   const trackOut = actx.createGain();
+  const panNode = actx.createStereoPanner();
   input.connect(eqLow); eqLow.connect(eqMid); eqMid.connect(eqHigh);
   eqHigh.connect(dry); dry.connect(trackOut);
   eqHigh.connect(conv); conv.connect(wet); wet.connect(trackOut);
-  trackOut.connect(masterGain);
-  track._chain = {input,eqLow,eqMid,eqHigh,dry,wet,trackOut};
+  trackOut.connect(panNode); panNode.connect(masterGain);
+  track._chain = {input,eqLow,eqMid,eqHigh,dry,wet,trackOut,panNode};
   applyInstrumentToChain(track);
 }
 function applyInstrumentToChain(track){
@@ -150,6 +151,55 @@ function applyInstrumentToChain(track){
   const wetAmt = inst.reverb/100;
   c.dry.gain.value = 1-wetAmt*0.6; c.wet.gain.value = wetAmt;
   c.trackOut.gain.value = (track.muted?0:1) * track.volume;
+  c.panNode.pan.value = (track.pan-50)/50;
+}
+
+/* ======================================================================
+   AUTOMATION LANES -> LIVE AUDIO PARAMETERS
+   each lane (Volume/Pan/Reverb/EQ Low/EQ Mid/EQ High) is a set of 0-100 points
+   plotted step->value; while a lane has no points drawn, its parameter just
+   tracks the track's own knob (see autoDefaultValue), so automation only takes
+   over once the user actually draws a curve for it
+   ====================================================================== */
+function automationValueAt(track, param, step){
+  const points = track.automation[param];
+  if(!points || points.length===0) return autoDefaultValue(track, param);
+  const pts = points.slice().sort((a,b)=>a.step-b.step);
+  if(step<=pts[0].step) return pts[0].value;
+  if(step>=pts[pts.length-1].step) return pts[pts.length-1].value;
+  for(let i=0;i<pts.length-1;i++){
+    const a=pts[i], b=pts[i+1];
+    if(step>=a.step && step<=b.step){
+      const f = (step-a.step)/((b.step-a.step)||1);
+      return a.value + (b.value-a.value)*f;
+    }
+  }
+  return pts[pts.length-1].value;
+}
+// smoothing time constant for setTargetAtTime: short enough to track the drawn curve responsively,
+// long enough (paired with the 25ms scheduler tick) to avoid zipper-noise clicks between updates
+const AUTOMATION_SMOOTHING = 0.02;
+function applyAutomationAtStep(step){
+  const solo = anySolo();
+  const now = actx.currentTime;
+  state.tracks.forEach(track=>{
+    if(!track._chain) buildChain(track);
+    const c = track._chain;
+    const audible = solo ? track.solo : !track.muted;
+    const vol = automationValueAt(track,"volume",step)/100;
+    const pan = Math.max(-1, Math.min(1, (automationValueAt(track,"pan",step)-50)/50));
+    const reverb = automationValueAt(track,"reverb",step)/100;
+    const eqLow = automationValueAt(track,"eqLow",step)/100*48-24;
+    const eqMid = automationValueAt(track,"eqMid",step)/100*48-24;
+    const eqHigh = automationValueAt(track,"eqHigh",step)/100*48-24;
+    c.trackOut.gain.setTargetAtTime(audible?vol:0, now, AUTOMATION_SMOOTHING);
+    c.panNode.pan.setTargetAtTime(pan, now, AUTOMATION_SMOOTHING);
+    c.eqLow.gain.setTargetAtTime(eqLow, now, AUTOMATION_SMOOTHING);
+    c.eqMid.gain.setTargetAtTime(eqMid, now, AUTOMATION_SMOOTHING);
+    c.eqHigh.gain.setTargetAtTime(eqHigh, now, AUTOMATION_SMOOTHING);
+    c.dry.gain.setTargetAtTime(1-reverb*0.6, now, AUTOMATION_SMOOTHING);
+    c.wet.gain.setTargetAtTime(reverb, now, AUTOMATION_SMOOTHING);
+  });
 }
 function anySolo(){ return state.tracks.some(t=>t.solo); }
 function refreshAllTrackGains(){
@@ -172,7 +222,7 @@ function getNoiseBuffer(){
 // every currently-sounding voice, so playback can be cut dead on pause/stop instead of letting
 // already-scheduled envelopes/oscillators ring out to their natural end
 let activeVoices = [];
-function playNote(track, midi, startTime, durSec, bendToMidi){
+function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec){
   if(!track._chain) buildChain(track);
   const inst = track.instrument;
   const env = actx.createGain();
@@ -186,19 +236,28 @@ function playNote(track, midi, startTime, durSec, bendToMidi){
   env.gain.linearRampToValueAtTime(0.0001, sustainEnd+rel);
   const stopAt = sustainEnd+rel+0.02;
   const hasBend = bendToMidi!=null && bendToMidi!==midi;
+  // the slide holds at the original pitch until the bend-start dot's point in time, then ramps —
+  // clamped so the hold never reaches past sustainEnd (leaving no time for the ramp to actually happen)
+  const bendAt = Math.min(sustainEnd-0.01, startTime+Math.max(0,bendDelaySec||0));
   let source;
 
   if(inst.wave==="custom" && inst.customBuffer){
     const src = actx.createBufferSource(); src.buffer = inst.customBuffer;
     src.playbackRate.setValueAtTime(Math.pow(2,(midi-inst.customBaseMidi)/12), startTime);
-    if(hasBend) src.playbackRate.linearRampToValueAtTime(Math.pow(2,(bendToMidi-inst.customBaseMidi)/12), sustainEnd);
+    if(hasBend){
+      src.playbackRate.setValueAtTime(Math.pow(2,(midi-inst.customBaseMidi)/12), bendAt);
+      src.playbackRate.linearRampToValueAtTime(Math.pow(2,(bendToMidi-inst.customBaseMidi)/12), sustainEnd);
+    }
     src.connect(env); src.start(startTime); src.stop(stopAt);
     source = src;
   } else if(inst.wave==="noise"){
     const src = actx.createBufferSource(); src.buffer = getNoiseBuffer(); src.loop=true;
     const bp = actx.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=1.2;
     bp.frequency.setValueAtTime(midiToFreq(midi)*2, startTime);
-    if(hasBend) bp.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi)*2, sustainEnd);
+    if(hasBend){
+      bp.frequency.setValueAtTime(midiToFreq(midi)*2, bendAt);
+      bp.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi)*2, sustainEnd);
+    }
     src.connect(bp); bp.connect(env);
     src.start(startTime); src.stop(stopAt);
     source = src;
@@ -211,14 +270,20 @@ function playNote(track, midi, startTime, durSec, bendToMidi){
     const wave = actx.createPeriodicWave(real,imag,{disableNormalization:false});
     osc.setPeriodicWave(wave);
     osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
-    if(hasBend) osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
+    if(hasBend){
+      osc.frequency.setValueAtTime(midiToFreq(midi), bendAt);
+      osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
+    }
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
     source = osc;
   } else {
     const osc = actx.createOscillator();
     osc.type = inst.wave;
     osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
-    if(hasBend) osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
+    if(hasBend){
+      osc.frequency.setValueAtTime(midiToFreq(midi), bendAt);
+      osc.frequency.linearRampToValueAtTime(midiToFreq(bendToMidi), sustainEnd);
+    }
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
     source = osc;
   }
@@ -253,6 +318,11 @@ let scheduledUpTo = 0;
 function startPlayback(){
   if(state.playing) return;
   if(actx.state==="suspended") actx.resume();
+  // pressing play with an active loop should always land you inside it, not silently play through
+  // from wherever the playhead happens to be sitting outside the loop's bounds
+  if(state.loop.enabled && (state.playStartStep<state.loop.start || state.playStartStep>=state.loop.end)){
+    state.playStartStep = state.loop.start;
+  }
   state.playing = true;
   playCtxStartTime = actx.currentTime;
   playStepAt0 = state.playStartStep;
@@ -263,11 +333,30 @@ function startPlayback(){
   requestAnimationFrame(animatePlayhead);
 }
 function stopPlayback(resetHead){
+  // must be read before state.playing flips to false — currentPlayStep() falls back to the
+  // (stale) state.playStartStep once playing is false, which was silently discarding the paused
+  // position and snapping the playhead back to wherever it last started from
+  const pausedAtStep = currentPlayStep();
   state.playing = false;
   clearInterval(schedulerTimer);
   document.getElementById("playBtn").innerHTML = "&#9654;";
-  if(resetHead) state.playStartStep = 0; else state.playStartStep = currentPlayStep();
+  state.playStartStep = resetHead ? 0 : pausedAtStep;
   silenceAllVoices();
+  // automation only drives the chain during playback; once stopped, drop each track back to its own knob values
+  state.tracks.forEach(applyInstrumentToChain);
+  renderPlayheads();
+}
+// seeks the playhead back to step 0 — if playback is running it keeps running (jumping straight to the
+// start, same as a "restart" transport control), otherwise it just moves where the next Play will begin
+function resetPlayhead(){
+  if(state.playing){
+    silenceAllVoices();
+    playCtxStartTime = actx.currentTime;
+    playStepAt0 = 0;
+    scheduledUpTo = 0;
+  } else {
+    state.playStartStep = 0;
+  }
   renderPlayheads();
 }
 function schedulerTick(){
@@ -279,6 +368,7 @@ function schedulerTick(){
     scheduledUpTo = playStepAt0;
     nowStep = playStepAt0;
   }
+  applyAutomationAtStep(nowStep);
   const horizon = nowStep + lookahead/stepDurSec();
   state.tracks.forEach(track=>{
     const solo = anySolo();
@@ -288,7 +378,7 @@ function schedulerTick(){
       if(note.step >= scheduledUpTo && note.step < horizon){
         const t = playCtxStartTime + (note.step - playStepAt0)*stepDurSec();
         if(t >= actx.currentTime-0.01){
-          playNote(track, note.pitch, t, note.dur*stepDurSec()*0.92, note.bendTo);
+          playNote(track, note.pitch, t, note.dur*stepDurSec()*0.92, note.bendTo, clampedBendStartStep(note)*stepDurSec());
         }
       }
     });
@@ -447,7 +537,7 @@ function drawGridLines(){
     const midi = rowToMidi(row);
     const name = NOTE_NAMES[((midi%12)+12)%12];
     const isNatural = name.indexOf("#")===-1;
-    ctx.fillStyle = name==="C" ? "rgba(94,230,168,.18)" : (isNatural ? "#2c2c34" : "#1c1c22");
+    ctx.fillStyle = name==="C" ? "rgba(111,168,255,.18)" : (isNatural ? "#2c2c34" : "#1c1c22");
     ctx.fillRect(0,row*ROW_H,w,ROW_H);
   }
   // horizontal separators
@@ -466,6 +556,13 @@ function drawGridLines(){
 }
 
 function selectedTrack(){ return state.tracks.find(t=>t.id===state.selectedTrackId); }
+
+// clamps a slurred note's bend-start offset (in steps, relative to note.step) to stay within the tile —
+// leaves a small sliver at the end so the slide is never squashed down to nothing
+function clampedBendStartStep(note){
+  const max = Math.max(0, note.dur-0.15);
+  return Math.max(0, Math.min(max, note.bendStartStep||0));
+}
 
 function renderNotes(){
   noteLayer.innerHTML="";
@@ -511,11 +608,19 @@ function renderNotes(){
       stub.style.background = "var(--accent2)";
       noteLayer.appendChild(stub);
 
-      // the slide is drawn from the note's left edge (rather than the resize handle on the right)
-      // so it reads as a glissando sweeping across the tile toward the slur target, independent of
-      // whatever's happening at the right-edge resize handle
+      // the slide is drawn from the bend-start dot (draggable across the tile, defaulting to the note's
+      // own left edge) rather than always the note's start, so the slur can begin partway through the note
+      const bendStartStep = clampedBendStartStep(note);
+      const startDot = document.createElement("div");
+      startDot.className = "bendStartHandle";
+      startDot.dataset.id = note.id;
+      startDot.title = "Drag to change where the slur begins";
+      startDot.style.left = (note.step*STEP_W + bendStartStep*STEP_W + 1)+"px";
+      startDot.style.top = (row*ROW_H + ROW_H/2)+"px";
+      noteLayer.appendChild(startDot);
+
       const svgNS = "http://www.w3.org/2000/svg";
-      const x1 = note.step*STEP_W+1, y1 = row*ROW_H+ROW_H/2;
+      const x1 = note.step*STEP_W + bendStartStep*STEP_W + 1, y1 = row*ROW_H+ROW_H/2;
       const x2 = stubLeft+(stubW-2)/2, y2 = destRow*ROW_H+ROW_H/2;
       const left = Math.min(x1,x2), top = Math.min(y1,y2);
       const w = Math.max(1,Math.abs(x2-x1)), h = Math.max(1,Math.abs(y2-y1));
@@ -534,6 +639,10 @@ function renderNotes(){
       noteLayer.appendChild(svg);
     }
   });
+
+  // keep the advanced editor's ghost note tiles live instead of only refreshing on open/close —
+  // cheap enough (small canvas) to just redraw every time the piano roll's notes change
+  if(state.advancedTrackId!=null) renderAdvancedEditor();
 }
 
 /* ======================================================================
@@ -697,7 +806,8 @@ function renderArrangeRuler(totalW){
 /* ======================================================================
    ADVANCED TRACK EDITOR (AUTOMATION LANES)
    ====================================================================== */
-const ADV_LANE_H = 190;
+let ADV_LANE_H = 160; // recalculated in renderAdvancedEditor from the lane card's actual measured height
+const ADV_LANE_TOP = 22; // must match #advLaneCanvas's CSS top offset (the header's own height — canvas sits flush beneath it, no gap, so header+canvas read as one continuous shape)
 const ADV_PARAM_LABELS = {volume:"Volume", pan:"Pan", reverb:"Reverb", eqLow:"EQ Low", eqMid:"EQ Mid", eqHigh:"EQ High"};
 
 // the value (0-100) this parameter shows as a flat line until the user actually draws a curve for it —
@@ -728,48 +838,64 @@ function renderAdvancedEditor(){
   header.style.background = track.color;
 
   const spb = stepsPerBar();
-  const totalW = Math.max(1, STEPS_TOTAL/spb*BAR_PX);
+  // fill at least the visible scroll viewport (plus a little breathing room past it), so the lane's
+  // colored backdrop reaches the right edge instead of stopping wherever the last bar happens to be
+  const scrollEl = document.getElementById("advLaneScroll");
+  const viewportW = scrollEl.clientWidth;
+  const totalW = Math.max(1, STEPS_TOTAL/spb*BAR_PX, viewportW-40)+40;
   document.getElementById("advLaneInner").style.width = totalW+"px";
   header.style.width = totalW+"px";
 
+  const laneW = totalW; // canvas now spans the full width, flush with the header above it — together they read as one continuous shape
+  // measured fresh each render so the canvas always fits the card's real height (accounting for the horizontal scrollbar), never spilling past its bottom edge
+  ADV_LANE_H = Math.max(40, scrollEl.clientHeight - ADV_LANE_TOP);
+
   const canvas = document.getElementById("advLaneCanvas");
   const dpr = window.devicePixelRatio||1;
-  canvas.width = totalW*dpr; canvas.height = ADV_LANE_H*dpr;
-  canvas.style.width = totalW+"px"; canvas.style.height = ADV_LANE_H+"px";
+  canvas.width = laneW*dpr; canvas.height = ADV_LANE_H*dpr;
+  canvas.style.width = laneW+"px"; canvas.style.height = ADV_LANE_H+"px";
   const ctx = canvas.getContext("2d"); ctx.scale(dpr,dpr);
-  ctx.clearRect(0,0,totalW,ADV_LANE_H);
+  ctx.clearRect(0,0,laneW,ADV_LANE_H);
 
-  // faint track-colored backdrop, echoing the arrange overview block's own coloring
-  ctx.fillStyle = track.color; ctx.globalAlpha = 0.12; ctx.fillRect(0,0,totalW,ADV_LANE_H); ctx.globalAlpha = 1;
-
-  // reference gridlines at 100/50/0%
-  ctx.strokeStyle = "rgba(255,255,255,.12)"; ctx.lineWidth = 1;
-  [0,0.5,1].forEach(f=>{
-    const y = Math.round(ADV_LANE_H*(1-f))+.5;
-    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(totalW,y); ctx.stroke();
-  });
-  // bar lines, matching the arrange ruler's spacing
-  const totalBars = Math.ceil(STEPS_TOTAL/spb);
-  ctx.strokeStyle = "rgba(255,255,255,.08)";
-  for(let bar=0; bar<=totalBars; bar++){
-    const x = bar*BAR_PX+.5;
-    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,ADV_LANE_H); ctx.stroke();
-  }
+  // solid track-colored backdrop, echoing the arrange overview block's own coloring (and the lane header above it)
+  ctx.fillStyle = track.color; ctx.globalAlpha = 0.4; ctx.fillRect(0,0,laneW,ADV_LANE_H); ctx.globalAlpha = 1;
 
   const points = track.automation[state.advancedParam].slice().sort((a,b)=>a.step-b.step);
   const valueToY = v=> ADV_LANE_H-(v/100*ADV_LANE_H);
   const stepToX = s=> s/spb*BAR_PX;
 
-  ctx.strokeStyle = "#6fa8ff";
+  // ghost note tiles from the track's own notes, positioned by step/duration and pitch —
+  // same idea as the mini note-pattern drawn inside the arrange overview's track blocks,
+  // just scaled to fill the full lane so you can see notes against the automation curve
+  if(track.notes.length){
+    const pitches = track.notes.map(n=>n.pitch);
+    const minP = Math.min(...pitches), maxP = Math.max(...pitches);
+    const range = Math.max(1, maxP-minP);
+    const tileH = Math.min(16, Math.max(6, ADV_LANE_H/(range+4)));
+    const padV = 8; // keeps tiles off the lane's own top/bottom edge, independent of the card's own outer inset
+    const travel = Math.max(4, ADV_LANE_H - padV*2 - tileH);
+    ctx.fillStyle = "rgba(216,255,230,.55)"; // near-white mint green, echoing the accent color
+    track.notes.forEach(n=>{
+      const nx = stepToX(n.step);
+      const nw = Math.max(2, stepToX(n.step+n.dur)-nx-1);
+      const t = (n.pitch-minP)/range;
+      const centerY = (ADV_LANE_H-padV-tileH/2) - t*travel;
+      ctx.beginPath();
+      ctx.roundRect(nx, centerY-tileH/2, nw, tileH, 2);
+      ctx.fill();
+    });
+  }
+
+  ctx.strokeStyle = "#ffffff";
   ctx.lineWidth = 2;
   ctx.beginPath();
   if(points.length===0){
     const y = valueToY(autoDefaultValue(track, state.advancedParam));
-    ctx.moveTo(0,y); ctx.lineTo(totalW,y);
+    ctx.moveTo(0,y); ctx.lineTo(laneW,y);
   } else {
     ctx.moveTo(0, valueToY(points[0].value));
     points.forEach(p=> ctx.lineTo(stepToX(p.step), valueToY(p.value)));
-    ctx.lineTo(totalW, valueToY(points[points.length-1].value));
+    ctx.lineTo(laneW, valueToY(points[points.length-1].value));
   }
   ctx.stroke();
 
@@ -1009,6 +1135,18 @@ function onGridMouseDown(e){
     }
   }
 
+  // the dot where the slur's slide-line meets the tile: drag it sideways to move where within the
+  // note the pitch actually starts sliding, independent of the note's own length or slur target
+  if(e.target.classList && e.target.classList.contains("bendStartHandle")){
+    const note = track.notes.find(n=>n.id===Number(e.target.dataset.id));
+    if(note){
+      pushHistory();
+      drag = {mode:"bendStartAdjust", noteId:note.id};
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+  }
+
   const {step,row,x,y} = xyToStepRow(e.clientX,e.clientY);
 
   // grab the playhead if the click lands near its current position
@@ -1120,16 +1258,6 @@ window.addEventListener("mousemove", (e)=>{
       const delta = Math.round(stepAt-loopDrag.downStep);
       const newStart = Math.max(0, Math.min(STEPS_TOTAL-len, loopDrag.startStart+delta));
       state.loop.start = newStart; state.loop.end = newStart+len;
-    } else if(loopDrag.mode==="create"){
-      if(!loopDrag.dragged && Math.abs(e.clientX-loopDrag.downX)>3) loopDrag.dragged = true;
-      if(loopDrag.dragged){
-        const cur = Math.round(stepAt);
-        const s = Math.max(0, Math.min(loopDrag.startStep, cur));
-        const en = Math.min(STEPS_TOTAL, Math.max(loopDrag.startStep, cur)+1);
-        state.loop.start = s; state.loop.end = Math.max(s+1, en);
-        state.loop.enabled = true;
-        document.getElementById("loopBtn").classList.add("on");
-      }
     }
     renderLoopUI();
     return;
@@ -1304,6 +1432,18 @@ window.addEventListener("mousemove", (e)=>{
       }
       showTooltip(e.clientX, e.clientY, note.dur+" step"+(note.dur===1?"":"s"));
     }
+  } else if(drag.mode==="bendStartAdjust"){
+    const note = track.notes.find(n=>n.id===drag.noteId);
+    if(note){
+      const max = Math.max(0, note.dur-0.15);
+      const raw = (x - note.step*STEP_W)/STEP_W;
+      const newBendStart = Math.round(Math.max(0, Math.min(max, raw))*4)/4; // snap to quarter-steps for a steady drag feel
+      if(newBendStart!==note.bendStartStep){
+        note.bendStartStep = newBendStart;
+        renderNotes();
+      }
+      showTooltip(e.clientX, e.clientY, "slur begins at step "+(note.step+newBendStart));
+    }
   }
 });
 window.addEventListener("mouseup", ()=>{
@@ -1374,7 +1514,7 @@ document.addEventListener("keydown", (e)=>{
       if(!track) return;
       state.trackClipboard = {
         name:track.name, color:track.color, instrument:Object.assign({},track.instrument),
-        volume:track.volume, notes: track.notes.map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null})),
+        volume:track.volume, notes: track.notes.map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null,bendStartStep:n.bendStartStep??0})),
         regions: track.regions ? track.regions.map(r=>({start:r.start,end:r.end})) : null
       };
       if(k==="x"){
@@ -1423,13 +1563,13 @@ document.addEventListener("keydown", (e)=>{
   const track = selectedTrack(); if(!track) return;
 
   if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="c"){
-    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null}));
+    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null,bendStartStep:n.bendStartStep??0}));
     if(state.clipboard.length) toast("Copied "+state.clipboard.length+" note(s)");
     e.preventDefault();
   } else if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="x"){
     if(!selectedNoteIds.size) return;
     pushHistory();
-    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null}));
+    state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null,bendStartStep:n.bendStartStep??0}));
     track.notes = track.notes.filter(n=>!selectedNoteIds.has(n.id));
     selectedNoteIds.clear();
     renderNotes(); buildOverview();
@@ -1443,7 +1583,7 @@ document.addEventListener("keydown", (e)=>{
     const newIds = [];
     state.clipboard.forEach(n=>{
       const id = nextNoteId++;
-      const newNote = {id, step: pasteAt+(n.step-minStep), pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null};
+      const newNote = {id, step: pasteAt+(n.step-minStep), pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null, bendStartStep:n.bendStartStep??0};
       track.notes.push(newNote);
       extendRegionsForNote(track, newNote);
       newIds.push(id);
@@ -1536,8 +1676,7 @@ document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
   const regionLeftPx = state.loop.start/spb*BAR_PX;
   const regionRightPx = state.loop.end/spb*BAR_PX;
   // resize handles get a forgiving pixel-tolerance hit zone around the loop's edges, rather than
-  // relying on landing exactly on the thin 7px handle element — a click a couple pixels off used to
-  // fall through to "create" and silently replace the whole loop with a new sliver at the click point
+  // relying on landing exactly on the thin 7px handle element
   const tolerance = 6;
   if(Math.abs(x-regionLeftPx) <= tolerance){
     loopDrag = {mode:"resizeL"};
@@ -1551,11 +1690,11 @@ document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
     loopDrag = {mode:"move", downStep:x/BAR_PX*spb, startStart:state.loop.start, startEnd:state.loop.end};
     e.preventDefault(); e.stopPropagation(); return;
   }
-  // only redefine the loop once the user actually drags — a bare click on empty ruler space
-  // shouldn't collapse/replace whatever loop region is already set
-  const startStep = Math.max(0, Math.round(x/BAR_PX*spb));
-  loopDrag = {mode:"create", downX:e.clientX, startStep, dragged:false};
-  e.preventDefault(); e.stopPropagation();
+  // clicking the ruler background (not a handle, not inside the existing region) no longer spins up
+  // a brand new loop — that made it impossible to grab the playhead flag if the click landed a few
+  // pixels off target, since it fell through to here and started drawing a loop instead. Loop editing
+  // now stays confined to the handles and the region body; leave the event alone so it can keep
+  // bubbling up to the playhead-flag-grab check on #timelineCol.
 });
 document.getElementById("loopBtn").addEventListener("click",()=>{
   state.loop.enabled = !state.loop.enabled;
@@ -1831,7 +1970,7 @@ document.getElementById("octaveSel").addEventListener("change",(e)=>{
 });
 
 document.getElementById("playBtn").addEventListener("click", ()=> state.playing? stopPlayback(false) : startPlayback());
-document.getElementById("stopBtn").addEventListener("click", ()=> stopPlayback(true));
+document.getElementById("stopBtn").addEventListener("click", resetPlayhead);
 
 function syncPianoScroll(){
   document.getElementById("pianoColInner").style.transform = "translateY("+(-gridScroll.scrollTop)+"px)";
@@ -1850,7 +1989,7 @@ function serializeProject(){
       instrument: { wave:t.instrument.wave, volume:t.instrument.volume, attack:t.instrument.attack,
         release:t.instrument.release, eqLow:t.instrument.eqLow, eqMid:t.instrument.eqMid,
         eqHigh:t.instrument.eqHigh, reverb:t.instrument.reverb, customBaseMidi:t.instrument.customBaseMidi },
-      notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null})),
+      notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null, bendStartStep:n.bendStartStep??0})),
       regions: t.regions ? t.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null,
       automation: cloneAutomation(t.automation)
     }))
@@ -1893,7 +2032,7 @@ function loadProject(data){
     track.color = t.color||track.color; track.muted=!!t.muted; track.solo=!!t.solo; track.volume = t.volume??0.8;
     track.pan = t.pan??50;
     track.instrument = Object.assign(defaultInstrument(), t.instrument||{});
-    track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null}; });
+    track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null, bendStartStep:n.bendStartStep??0}; });
     track.regions = (t.regions||null) && t.regions.map(r=>{ nextNoteId=Math.max(nextNoteId, (r.id||0)+1); return {id:r.id||nextNoteId++, start:r.start, end:r.end}; });
     track.automation = defaultAutomation();
     if(t.automation){

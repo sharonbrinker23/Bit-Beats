@@ -16,8 +16,8 @@
   <div id="logo">&#9642; BIT BEATS</div>
 
   <div class="hgroup">
-    <button id="playBtn" title="Play">&#9654;</button>
-    <button id="stopBtn" title="Stop">&#9632;</button>
+    <button id="playBtn" title="Play / Pause">&#9654;</button>
+    <button id="stopBtn" title="Reset playhead to start">&#9198;</button>
     <button id="loopBtn" title="Toggle loop playback">&#8635; Loop</button>
   </div>
 
@@ -137,12 +137,15 @@
 <!-- ================= ADVANCED TRACK EDITOR (AUTOMATION) ================= -->
 <div id="advancedEditor" class="hidden">
   <div id="advTabs">
-    <button data-param="volume" class="advTabBtn">Volume</button>
-    <button data-param="eqLow" class="advTabBtn">EQ Low</button>
-    <button data-param="pan" class="advTabBtn">Pan</button>
-    <button data-param="eqMid" class="advTabBtn">EQ Mid</button>
-    <button data-param="reverb" class="advTabBtn">Reverb</button>
-    <button data-param="eqHigh" class="advTabBtn">EQ High</button>
+    <button id="advCloseBtn" title="Close advanced editor">&#10005;</button>
+    <div id="advTabGrid">
+      <button data-param="volume" class="advTabBtn">Volume</button>
+      <button data-param="eqLow" class="advTabBtn">EQ Low</button>
+      <button data-param="pan" class="advTabBtn">Pan</button>
+      <button data-param="eqMid" class="advTabBtn">EQ Mid</button>
+      <button data-param="reverb" class="advTabBtn">Reverb</button>
+      <button data-param="eqHigh" class="advTabBtn">EQ High</button>
+    </div>
   </div>
   <div id="advLaneScroll">
     <div id="advLaneInner">
@@ -151,7 +154,6 @@
       <div id="advPointLayer"></div>
     </div>
   </div>
-  <button id="advCloseBtn" title="Close advanced editor">&#10005;</button>
 </div>
 
 <div id="rollDivider"></div>
