@@ -6,6 +6,7 @@
   --danger:#ff6b6b; --warn:#ffd166;
   --row-a:#1b1b21; --row-b:#202027; --row-c:#25252d;
   --row-light:#2c2c34; --row-dark:#1c1c22; --row-c:rgba(111,168,255,.18);
+  --row-c3:#34343e;
 }
 *{box-sizing:border-box;}
 html,body{height:100%;}
@@ -42,6 +43,7 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 #playBtn{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#0a1a12;font-size:14px;}
 #stopBtn{width:30px;height:30px;border-radius:50%;}
 #loopBtn.on{background:var(--accent2); color:#071226; border-color:var(--accent2);}
+#metroBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
 
 /* ===== TRACK OVERVIEW (GarageBand-like arrange area) ===== */
 #arrange{
@@ -176,7 +178,7 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
 .leftHandle{position:absolute; left:-3px; top:0; width:7px; height:100%; cursor:ew-resize; z-index:4;}
 .note:hover .bendHandle, .note:hover .leftHandle{background:rgba(255,255,255,.3); border-radius:2px;}
 .bendStub{
-  position:absolute; border-radius:3px; opacity:.85; cursor:ns-resize; z-index:2;
+  position:absolute; border-radius:3px; opacity:.85; cursor:move; z-index:2;
   border:1px solid rgba(0,0,0,.4);
 }
 .bendStub:hover{opacity:1; box-shadow:0 0 0 1px #fff;}
