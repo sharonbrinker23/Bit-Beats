@@ -41,9 +41,10 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 .hgroup{display:flex; align-items:flex-end; gap:8px; padding:0 8px; border-left:1px solid var(--line);}
 .hgroup:first-of-type{border-left:none;}
 #playBtn{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#0a1a12;font-size:14px;}
-#stopBtn{width:30px;height:30px;border-radius:50%;}
+#holdPosBtn{width:30px;height:30px;border-radius:50%;}
 #loopBtn.on{background:var(--accent2); color:#071226; border-color:var(--accent2);}
 #metroBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+#holdPosBtn.on{background:var(--accent3); color:#2a1200; border-color:var(--accent3); font-weight:600;}
 
 /* ===== TRACK OVERVIEW (GarageBand-like arrange area) ===== */
 #arrange{
@@ -155,9 +156,13 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 /* ===== PIANO ROLL ===== */
 #rollWrap{flex:1; display:flex; overflow:hidden; position:relative;}
 #pianoCol{
-  width:64px; flex-shrink:0; overflow:hidden; background:var(--bg1); border-right:1px solid var(--line); position:relative;
+  width:64px; flex-shrink:0; overflow:hidden; background:var(--bg1); position:relative;
 }
-#pianoColInner{position:relative;}
+/* the header spacer deliberately has no right border of its own, so it reads as one continuous bar
+   with the grid ruler beside it instead of a separate, walled-off box — the divider between the piano
+   keys and the note grid below picks back up on #pianoColInner instead */
+#pianoColHeaderSpacer{height:18px; border-bottom:1px solid var(--line); background:var(--bg1);}
+#pianoColInner{position:relative; border-right:1px solid var(--line);}
 .pianoRowLabel{
   position:absolute; left:0; right:0; display:flex; align-items:center; justify-content:flex-end;
   padding-right:8px; font-size:10px; color:var(--text-dim); border-bottom:1px solid #000;
@@ -167,8 +172,12 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 
 #gridScroll{flex:1; overflow:auto; position:relative; background:var(--bg0);}
 #gridInner{position:relative;}
-canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
-#noteLayer{position:absolute; top:0; left:0; z-index:2;}
+#gridRuler{
+  position:sticky; top:0; height:18px; z-index:6; background:var(--bg1); border-bottom:1px solid var(--line);
+  cursor:ew-resize;
+}
+canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
+#noteLayer{position:absolute; top:18px; left:0; z-index:2;}
 .note{
   position:absolute; border-radius:3px; cursor:grab; border:1px solid rgba(0,0,0,.4);
   box-shadow:0 1px 2px rgba(0,0,0,.4);
@@ -192,11 +201,14 @@ canvas#gridCanvas{position:absolute; top:0; left:0; z-index:1;}
   position:absolute; border:1px solid var(--accent2); background:rgba(111,168,255,.15); z-index:4; pointer-events:none; display:none;
 }
 #playhead{
-  position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none; box-shadow:0 0 6px #fff; cursor:ew-resize;
+  position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:7; pointer-events:none; box-shadow:0 0 6px #fff; cursor:ew-resize;
 }
+/* sticky (not JS-positioned) so it tracks the same native, compositor-driven scroll as the ruler itself —
+   a JS scroll-event handler updating "top" on every scroll tick visibly lagged a frame or more behind
+   the ruler's own sticky positioning, especially during fast/inertial scrolling */
 #playheadGrip{
-  position:absolute; top:0; left:-7px; width:16px; height:14px; background:#fff; border-radius:0 0 4px 4px;
-  pointer-events:auto; cursor:ew-resize; box-shadow:0 0 4px rgba(255,255,255,.7);
+  position:sticky; top:0; width:16px; height:14px; background:#fff; border-radius:0 0 4px 4px;
+  pointer-events:auto; cursor:ew-resize; box-shadow:0 0 4px rgba(255,255,255,.7); z-index:7; margin-left:-7px;
 }
 #playheadOverview{cursor:ew-resize;}
 #loopBar{

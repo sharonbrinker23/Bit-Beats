@@ -17,7 +17,7 @@
 
   <div class="hgroup">
     <button id="playBtn" title="Play / Pause">&#9654;</button>
-    <button id="stopBtn" title="Reset playhead to start">&#9198;</button>
+    <button id="holdPosBtn" title="When on, pausing keeps the playhead where it is. When off, pausing jumps it back to the start.">&#9209;</button>
     <button id="loopBtn" title="Toggle loop playback">&#8635; Loop</button>
   </div>
 
@@ -41,7 +41,7 @@
         <option value="1">Sixteenth</option>
       </select>
     </label>
-    <button id="metroBtn" title="Toggle metronome click">&#9834; Metro</button>
+    <button id="metroBtn" title="Toggle metronome click">MM</button>
   </div>
 
   <div class="hgroup">
@@ -162,14 +162,17 @@
 <!-- ================= PIANO ROLL ================= -->
 <div id="rollWrap">
   <div id="pianoCol">
+    <div id="pianoColHeaderSpacer"></div>
     <div id="pianoColInner"></div>
   </div>
   <div id="gridScroll">
     <div id="gridInner">
+      <div id="gridRuler" title="Click or drag to move the playhead"></div>
       <canvas id="gridCanvas"></canvas>
       <div id="noteLayer"></div>
       <div id="selectionBox"></div>
-      <div id="playhead"><div id="playheadGrip"></div></div>
+      <div id="playhead"></div>
+      <div id="playheadGrip"></div>
     </div>
   </div>
 </div>

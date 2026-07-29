@@ -7,6 +7,8 @@
 const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const OCT_MIN = 0, OCT_MAX = 7;
 const ROW_H = 18;
+const GRID_RULER_H = 18; // reserved band at the top of the piano roll for the bar-number ruler — real
+// space (not an overlay), so no note row ever shares pixels with it; must match #gridRuler's CSS height
 let STEP_W = 26;
 const STEP_W_MIN = 5, STEP_W_MAX = 70;
 const STEPS_TOTAL_BASE = 256; // 16th-note steps available on the grid (~16 bars @4/4)
@@ -32,13 +34,22 @@ let state = {
   bpm:120, timeSig:[4,4], key:"C", mode:"Major", octaveFocus:4, noteLenSteps:4,
   tracks: [], selectedTrackId:null, clipboard:[], trackClipboard:null, playing:false, playStartStep:0,
   loop:{enabled:false, start:0, end:16}, advancedTrackId:null, advancedParam:"volume",
-  metronomeOn:false
+  metronomeOn:false, holdPositionOnPause:false
 };
 let selectedNoteIds = new Set();
 let selectedRegionIds = new Set(); // shift-selected split-region blocks in the arrange timeline
 let selectedAutoPointIds = new Set(); // selected automation dots in the advanced track editor
 let nextTrackId=1, nextNoteId=1;
 let editContext = "notes"; // "notes" or "track" — decides what Ctrl+C/Ctrl+V act on
+// throttles Ctrl+V so holding/mashing it can't fire dozens of paste-and-rerender cycles a second
+let lastPasteAt = 0;
+const PASTE_COOLDOWN_MS = 200;
+function pasteOnCooldown(){
+  const now = performance.now();
+  if(now-lastPasteAt < PASTE_COOLDOWN_MS) return true;
+  lastPasteAt = now;
+  return false;
+}
 
 function defaultInstrument(){
   return { wave:"square", volume:0.8, attack:5, release:80, eqLow:0, eqMid:0, eqHigh:0, reverb:0,
@@ -364,19 +375,11 @@ function stopPlayback(resetHead){
   state.tracks.forEach(applyInstrumentToChain);
   renderPlayheads();
 }
-// seeks the playhead back to step 0 — if playback is running it keeps running (jumping straight to the
-// start, same as a "restart" transport control), otherwise it just moves where the next Play will begin
-function resetPlayhead(){
-  if(state.playing){
-    silenceAllVoices();
-    playCtxStartTime = actx.currentTime;
-    playStepAt0 = 0;
-    scheduledUpTo = 0;
-    scheduledMetroUpTo = 0;
-  } else {
-    state.playStartStep = 0;
-  }
-  renderPlayheads();
+// the Play button's own play/pause toggle — whether pausing keeps the playhead where it paused or
+// snaps it back to the start is governed by the "Hold" button (off by default: snaps back)
+function togglePlayPause(){
+  if(state.playing) stopPlayback(!state.holdPositionOnPause);
+  else startPlayback();
 }
 function schedulerTick(){
   const lookahead = 0.12; // seconds
@@ -429,6 +432,10 @@ function renderPlayheads(){
   const step = currentPlayStep();
   const x = step*STEP_W;
   document.getElementById("playhead").style.left = x+"px";
+  // the grip is a sticky sibling (not JS-positioned vertically — see its CSS), so it only needs its
+  // horizontal offset kept in sync with the playhead line; its "stuck" vertical tracking of the ruler
+  // is handled natively by the browser's compositor, with zero lag versus a scroll-event handler
+  document.getElementById("playheadGrip").style.left = x+"px";
   document.getElementById("playheadOverview").style.left = (step/stepsPerBar()*BAR_PX) +"px";
   positionOverviewFlag();
 }
@@ -516,10 +523,46 @@ function stepsPerBar(){ return beatsPerBar()*stepsPerBeat()*(4/state.timeSig[1])
 
 function sizeGrid(){
   const w = STEPS_TOTAL*STEP_W, h = TOTAL_ROWS*ROW_H;
-  gridInner.style.width=w+"px"; gridInner.style.height=h+"px";
+  // gridInner reserves real space for the ruler (GRID_RULER_H) on top of the row content — the canvas
+  // and note layer themselves stay sized to just the rows (h) and are pushed down via their own CSS
+  // top offset, so nothing here needs to know about the ruler except the container's total height
+  gridInner.style.width=w+"px"; gridInner.style.height=(h+GRID_RULER_H)+"px";
   gridCanvas.width=w; gridCanvas.height=h; gridCanvas.style.width=w+"px"; gridCanvas.style.height=h+"px";
   noteLayer.style.width=w+"px"; noteLayer.style.height=h+"px";
   drawGridLines();
+  drawGridRuler();
+}
+
+// bar-number ruler pinned atop the piano roll grid itself — same idea as the arrange view's ruler,
+// but scaled to STEP_W (which changes with zoom) instead of the arrange view's fixed BAR_PX, since it
+// shares the note grid's own horizontal coordinate space
+function drawGridRuler(){
+  const ruler = document.getElementById("gridRuler");
+  if(!ruler) return;
+  const totalW = STEPS_TOTAL*STEP_W;
+  const h = 18, dpr = window.devicePixelRatio||1;
+  const canvas = document.createElement("canvas");
+  canvas.width = totalW*dpr; canvas.height = h*dpr;
+  canvas.style.width = totalW+"px"; canvas.style.height = h+"px";
+  ruler.innerHTML = ""; ruler.appendChild(canvas);
+  const ctx = canvas.getContext("2d"); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,totalW,h);
+  const spb = stepsPerBar(), beats = beatsPerBar(), barPx = spb*STEP_W;
+  const totalBars = Math.ceil(STEPS_TOTAL/spb);
+  ctx.font = "10px -apple-system,BlinkMacSystemFont,sans-serif";
+  ctx.textBaseline = "top";
+  for(let bar=0; bar<totalBars; bar++){
+    const x = bar*barPx;
+    ctx.strokeStyle = "#5a5a68"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x+.5, 0); ctx.lineTo(x+.5, h); ctx.stroke();
+    ctx.fillStyle = "#b7b7c2";
+    ctx.fillText(String(bar+1), x+4, 2);
+    ctx.strokeStyle = "#3a3a44";
+    for(let b=1; b<beats; b++){
+      const bx = x + b*(barPx/beats);
+      ctx.beginPath(); ctx.moveTo(bx+.5, h*0.6); ctx.lineTo(bx+.5, h); ctx.stroke();
+    }
+  }
 }
 
 // grow the timeline (grid + ruler) to keep some empty room past whatever the furthest note/track content reaches —
@@ -1062,7 +1105,7 @@ function scrollGridToFirstNote(trackId){
   const firstNote = track.notes.reduce((a,b)=> b.step<a.step ? b : a);
   gridScroll.scrollLeft = Math.max(0, firstNote.step*STEP_W - 40);
   const row = midiToRow(firstNote.pitch);
-  gridScroll.scrollTop = Math.max(0, row*ROW_H - gridScroll.clientHeight/2);
+  gridScroll.scrollTop = Math.max(0, row*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2);
   syncPianoScroll();
 }
 function addTrack(){
@@ -1096,7 +1139,10 @@ let suppressTimelineClick = false;
 function xyToStepRow(clientX, clientY){
   const rect = gridInner.getBoundingClientRect();
   const x = clientX-rect.left, y = clientY-rect.top;
-  return { step: Math.floor(x/STEP_W), row: Math.floor(y/ROW_H), x, y };
+  // x/y stay raw (gridInner-relative) since that's the same coordinate space the note layer and
+  // selection box already render in (both pushed down by GRID_RULER_H via CSS) — only the row index
+  // needs the ruler's reserved band subtracted out before dividing into row units
+  return { step: Math.floor(x/STEP_W), row: Math.floor((y-GRID_RULER_H)/ROW_H), x, y };
 }
 
 // largest duration (in steps) startable at `step` in `row` before hitting the next note, so tiles never overlap
@@ -1359,7 +1405,7 @@ window.addEventListener("mousemove", (e)=>{
     const w = Math.abs(x-drag.x0), h=Math.abs(y-drag.y0);
     box.style.left=left+"px"; box.style.top=top+"px"; box.style.width=w+"px"; box.style.height=h+"px";
     const s0=Math.floor(left/STEP_W), s1=Math.ceil((left+w)/STEP_W);
-    const r0=Math.floor(top/ROW_H), r1=Math.ceil((top+h)/ROW_H);
+    const r0=Math.floor((top-GRID_RULER_H)/ROW_H), r1=Math.ceil((top+h-GRID_RULER_H)/ROW_H);
     selectedNoteIds = new Set(drag.baseline);
     track.notes.forEach(n=>{
       const r = midiToRow(n.pitch);
@@ -1591,6 +1637,7 @@ document.addEventListener("keydown", (e)=>{
       }
     } else {
       if(!state.trackClipboard) return;
+      if(pasteOnCooldown()){ e.preventDefault(); return; }
       pushHistory();
       const c = state.trackClipboard;
       const newTrack = makeTrack(c.name+" copy", state.tracks.length);
@@ -1640,6 +1687,7 @@ document.addEventListener("keydown", (e)=>{
     e.preventDefault();
   } else if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="v"){
     if(!state.clipboard.length) return;
+    if(pasteOnCooldown()){ e.preventDefault(); return; }
     pushHistory();
     const minStep = Math.min(...state.clipboard.map(n=>n.step));
     const pasteAt = Math.round(currentPlayStep());
@@ -1702,7 +1750,7 @@ document.addEventListener("keydown", (e)=>{
     renderNotes(); buildOverview(); recomputeStepsTotal(); e.preventDefault();
   } else if(e.code==="Space"){
     e.preventDefault();
-    state.playing? stopPlayback(false) : startPlayback();
+    togglePlayPause();
   }
 });
 
@@ -1723,6 +1771,17 @@ gridCanvas.addEventListener("contextmenu",(e)=>{
 document.getElementById("playheadGrip").addEventListener("mousedown",(e)=>{
   if(state.playing) stopPlayback(false);
   playheadDrag = {type:"grid"};
+  e.preventDefault(); e.stopPropagation();
+});
+
+// secondary timeline pinned atop the note grid itself — click to jump the playhead there directly, or
+// drag same as the flag/grip, without needing to first scroll all the way up to the arrange view
+document.getElementById("gridRuler").addEventListener("mousedown",(e)=>{
+  if(state.playing) stopPlayback(false);
+  const rect = gridInner.getBoundingClientRect();
+  state.playStartStep = Math.max(0, Math.min(STEPS_TOTAL, (e.clientX-rect.left)/STEP_W));
+  playheadDrag = {type:"grid"};
+  renderPlayheads();
   e.preventDefault(); e.stopPropagation();
 });
 
@@ -2038,7 +2097,7 @@ document.getElementById("sampleInput").addEventListener("change",(e)=>{
    ====================================================================== */
 document.getElementById("bpmInput").addEventListener("change",(e)=>{ state.bpm = Math.max(30,Math.min(300,Number(e.target.value)||120)); });
 document.getElementById("timeSigSel").addEventListener("change",(e)=>{
-  const [a,b] = e.target.value.split("/").map(Number); state.timeSig=[a,b]; drawGridLines(); buildOverview();
+  const [a,b] = e.target.value.split("/").map(Number); state.timeSig=[a,b]; drawGridLines(); drawGridRuler(); buildOverview();
 });
 document.getElementById("noteLenSel").addEventListener("change",(e)=>{ state.noteLenSteps = Number(e.target.value); });
 document.getElementById("keySel").addEventListener("change",(e)=>{ state.key=e.target.value; buildPianoLabels(); drawGridLines(); });
@@ -2046,12 +2105,16 @@ document.getElementById("modeSel").addEventListener("change",(e)=>{ state.mode=e
 document.getElementById("octaveSel").addEventListener("change",(e)=>{
   state.octaveFocus = Number(e.target.value);
   const midi=(state.octaveFocus+1)*12;
-  gridScroll.scrollTop = midiToRow(midi)*ROW_H - gridScroll.clientHeight/2;
+  gridScroll.scrollTop = midiToRow(midi)*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2;
   syncPianoScroll();
 });
 
-document.getElementById("playBtn").addEventListener("click", ()=> state.playing? stopPlayback(false) : startPlayback());
-document.getElementById("stopBtn").addEventListener("click", resetPlayhead);
+document.getElementById("playBtn").addEventListener("click", togglePlayPause);
+document.getElementById("holdPosBtn").addEventListener("click",()=>{
+  state.holdPositionOnPause = !state.holdPositionOnPause;
+  document.getElementById("holdPosBtn").classList.toggle("on", state.holdPositionOnPause);
+  toast(state.holdPositionOnPause ? "Pause holds playhead position" : "Pause resets playhead to start");
+});
 
 function syncPianoScroll(){
   document.getElementById("pianoColInner").style.transform = "translateY("+(-gridScroll.scrollTop)+"px)";
@@ -2163,7 +2226,7 @@ function initDefaultProject(){
   state.selectedTrackId = t1.id;
   renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
   const midi=(state.octaveFocus+1)*12;
-  gridScroll.scrollTop = midiToRow(midi)*ROW_H - gridScroll.clientHeight/2;
+  gridScroll.scrollTop = midiToRow(midi)*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2;
   syncPianoScroll();
   renderPlayheads();
 }
