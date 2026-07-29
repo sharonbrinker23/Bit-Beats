@@ -161,7 +161,7 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 /* the header spacer deliberately has no right border of its own, so it reads as one continuous bar
    with the grid ruler beside it instead of a separate, walled-off box — the divider between the piano
    keys and the note grid below picks back up on #pianoColInner instead */
-#pianoColHeaderSpacer{height:18px; border-bottom:1px solid var(--line); background:var(--bg1);}
+#pianoColHeaderSpacer{height:18px; border-bottom:1px solid var(--line); background:var(--bg1); position:relative; z-index:6;}
 #pianoColInner{position:relative; border-right:1px solid var(--line);}
 .pianoRowLabel{
   position:absolute; left:0; right:0; display:flex; align-items:center; justify-content:flex-end;
@@ -205,10 +205,19 @@ canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
 }
 /* sticky (not JS-positioned) so it tracks the same native, compositor-driven scroll as the ruler itself —
    a JS scroll-event handler updating "top" on every scroll tick visibly lagged a frame or more behind
-   the ruler's own sticky positioning, especially during fast/inertial scrolling */
+   the ruler's own sticky positioning, especially during fast/inertial scrolling.
+   Horizontal placement must come from `transform`, not `left`: giving a sticky element any non-auto
+   inset (including left) makes the browser stick that axis too, so a JS-driven `left` here would freeze
+   the grip in the viewport instead of scrolling with the grid whenever it's scrolled programmatically
+   (e.g. jumping the playhead from the tracklist auto-scrolls the grid out from under it).
+   margin-top cancels out #gridRuler's reserved 18px of flow height above it: without this, the grip's
+   natural (unstuck) resting spot is 18px down — below the ruler, at the very first note row — so at
+   scrollTop 0 it sits outside the header and only slides up into the ruler band once you've scrolled
+   past that 18px and stickiness actually engages. */
 #playheadGrip{
   position:sticky; top:0; width:16px; height:14px; background:#fff; border-radius:0 0 4px 4px;
-  pointer-events:auto; cursor:ew-resize; box-shadow:0 0 4px rgba(255,255,255,.7); z-index:7; margin-left:-7px;
+  pointer-events:auto; cursor:ew-resize; box-shadow:0 0 4px rgba(255,255,255,.7); z-index:7;
+  margin-left:-7px; margin-top:-18px;
 }
 #playheadOverview{cursor:ew-resize;}
 #loopBar{

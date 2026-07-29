@@ -434,8 +434,10 @@ function renderPlayheads(){
   document.getElementById("playhead").style.left = x+"px";
   // the grip is a sticky sibling (not JS-positioned vertically — see its CSS), so it only needs its
   // horizontal offset kept in sync with the playhead line; its "stuck" vertical tracking of the ruler
-  // is handled natively by the browser's compositor, with zero lag versus a scroll-event handler
-  document.getElementById("playheadGrip").style.left = x+"px";
+  // is handled natively by the browser's compositor, with zero lag versus a scroll-event handler.
+  // Positioned via transform, not left: a sticky element sticks whichever axis has a non-auto inset,
+  // so setting `left` here would also freeze the grip horizontally once the grid scrolled underneath it.
+  document.getElementById("playheadGrip").style.transform = "translateX("+x+"px)";
   document.getElementById("playheadOverview").style.left = (step/stepsPerBar()*BAR_PX) +"px";
   positionOverviewFlag();
 }
@@ -1712,41 +1714,57 @@ document.addEventListener("keydown", (e)=>{
     }
   } else if(e.key==="ArrowUp" && selectedNoteIds.size){
     pushHistory();
+    let previewPitch = null;
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const p = Math.min(127,n.pitch+1), r = midiToRow(p);
       if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && n.step<o.step+o.dur && n.step+n.dur>o.step)){
         if(n.bendTo!=null) n.bendTo = Math.min(127, n.bendTo+1);
         n.pitch=p;
+        if(previewPitch==null) previewPitch = p;
       }
     });
+    if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
     renderNotes(); e.preventDefault();
   } else if(e.key==="ArrowDown" && selectedNoteIds.size){
     pushHistory();
+    let previewPitch = null;
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const p = Math.max(0,n.pitch-1), r = midiToRow(p);
       if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && n.step<o.step+o.dur && n.step+n.dur>o.step)){
         if(n.bendTo!=null) n.bendTo = Math.max(0, n.bendTo-1);
         n.pitch=p;
+        if(previewPitch==null) previewPitch = p;
       }
     });
+    if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
     renderNotes(); e.preventDefault();
   } else if(e.key==="ArrowLeft" && selectedNoteIds.size){
     pushHistory();
+    let previewPitch = null;
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const s = Math.max(0,n.step-1), r = midiToRow(n.pitch);
-      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && s<o.step+o.dur && s+n.dur>o.step)) n.step=s;
+      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && s<o.step+o.dur && s+n.dur>o.step)){
+        n.step=s;
+        if(previewPitch==null) previewPitch = n.pitch;
+      }
     });
+    if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
     renderNotes(); buildOverview(); e.preventDefault();
   } else if(e.key==="ArrowRight" && selectedNoteIds.size){
     pushHistory();
+    let previewPitch = null;
     track.notes.forEach(n=>{
       if(!selectedNoteIds.has(n.id)) return;
       const s = n.step+1, r = midiToRow(n.pitch);
-      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && s<o.step+o.dur && s+n.dur>o.step)) n.step=s;
+      if(!track.notes.some(o=>!selectedNoteIds.has(o.id) && midiToRow(o.pitch)===r && s<o.step+o.dur && s+n.dur>o.step)){
+        n.step=s;
+        if(previewPitch==null) previewPitch = n.pitch;
+      }
     });
+    if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
     renderNotes(); buildOverview(); recomputeStepsTotal(); e.preventDefault();
   } else if(e.code==="Space"){
     e.preventDefault();
