@@ -8,7 +8,7 @@
 </head>
 <body>
 
-<input type="file" id="loadInput" accept=".json" class="hidden">
+<input type="file" id="loadInput" accept=".json,.mid,.midi" class="hidden">
 <input type="file" id="sampleInput" accept="audio/*" class="hidden">
 
 <!-- ================= HEADER ================= -->
@@ -18,7 +18,22 @@
   <div class="hgroup">
     <button id="playBtn" title="Play / Pause">&#9654;</button>
     <button id="holdPosBtn" title="When on, pausing keeps the playhead where it is. When off, pausing jumps it back to the start.">&#9209;</button>
-    <button id="loopBtn" title="Toggle loop playback">&#8635; Loop</button>
+    <button id="loopBtn" class="icon" title="Toggle loop playback">&#8635;</button>
+  </div>
+
+  <div class="hgroup" style="margin-left:auto;">
+    <button id="undoBtn" title="Undo (Ctrl+Z)">&#8630; Undo</button>
+    <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">&#8631; Redo</button>
+    <button id="newBtn">New</button>
+    <button id="saveBtn" class="primary">Save</button>
+    <button id="loadBtn">Load</button>
+  </div>
+</div>
+
+<!-- ================= SUB-HEADER (project title + musical settings) ================= -->
+<div id="subHeader">
+  <div id="projectTitleWrap">
+    <span id="projectTitle" title="Double-click to rename the project">Bit Beats Project</span>
   </div>
 
   <div class="hgroup">
@@ -41,7 +56,14 @@
         <option value="1">Sixteenth</option>
       </select>
     </label>
-    <button id="metroBtn" title="Toggle metronome click">MM</button>
+    <!-- flat metronome silhouette: hollow trapezoid body (even-odd ring) + pendulum rod and weight -->
+    <button id="metroBtn" title="Toggle metronome click">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+        <path fill-rule="evenodd" d="M12 1.5 20.5 21.5H3.5L12 1.5zM12 6.4 6.9 18.4h10.2L12 6.4z"/>
+        <path d="M9.9 18.4 13.6 6.5l1.2.4-3.6 11.5z"/>
+        <path d="M9.6 12.3 13.5 11.1 14 12.7 10.1 13.9z"/>
+      </svg>
+    </button>
   </div>
 
   <div class="hgroup">
@@ -59,40 +81,41 @@
       <select id="octaveSel"></select>
     </label>
   </div>
-
-  <div class="hgroup">
-    <button id="addTrackBtnTop">+ Track</button>
-    <button id="splitBtn">Split at Playhead</button>
-    <button id="deleteTrackBtn">Delete Track</button>
-  </div>
-
-  <div class="hgroup" style="margin-left:auto;">
-    <button id="undoBtn" title="Undo (Ctrl+Z)">&#8630; Undo</button>
-    <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">&#8631; Redo</button>
-    <button id="newBtn">New</button>
-    <button id="saveBtn" class="primary">Save</button>
-    <button id="loadBtn">Load</button>
-  </div>
 </div>
 
-<!-- ================= ARRANGE / TRACK OVERVIEW ================= -->
+<!-- ============ ARRANGE: INSTRUMENT LIST + TRACK LIST ============ -->
 <div id="arrange">
-  <div id="trackListCol">
-    <div id="trackListHeaderSpacer"></div>
-    <div id="trackList"></div>
-    <button id="addTrackBtn">+ Add Instrument Track</button>
-  </div>
-  <div id="timelineCol">
-    <div id="timelineInner">
-      <div id="playheadOverview"></div>
+  <div id="instrumentListCol">
+    <div id="instrumentListScroll">
+      <div id="instrumentListHeaderSpacer"></div>
+      <div id="instrumentList"></div>
+    </div>
+    <div id="instrumentToolbar">
+      <button id="addTrackBtnTop" class="icon flat" title="Add Track">&#43;</button>
+      <button id="splitBtn" class="icon flat" title="Split at Playhead">&#9986;</button>
+      <button id="deleteTrackBtn" class="icon flat" title="Delete Track">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M9 3h6l1 2h4v2H4V5h4l1-2zm-3 6h12l-1 12H7L6 9zm3 2v8h1.5v-8H9zm4.5 0v8H15v-8h-1.5z"/></svg>
+      </button>
+    </div>
+    <div id="instrumentListZoomBar">
+      <span class="zoomBarIcon" title="Track row height (vertical shrink)">&#8597;</span>
+      <input type="range" id="instrumentRowHeightSlider" min="34" max="90" value="46" title="Track row height (vertical shrink)">
+      <span class="zoomBarIcon" title="Track zoom (horizontal)">&#8596;</span>
+      <input type="range" id="trackZoomSlider" min="20" max="160" value="60" title="Track zoom (horizontal)">
     </div>
   </div>
+  <div id="vResizerInstrumentList" class="vResizer" title="Drag to resize"></div>
+  <div id="trackListCol">
+    <div id="trackListInner">
+      <div id="trackListPlayhead"></div>
+    </div>
+  </div>
+  <div id="vResizerInstEditor" class="vResizer" title="Drag to resize"></div>
 
   <!-- ================= INSTRUMENT EDITOR ================= -->
   <div id="instEditor">
     <div class="instTopRow">
       <label class="field">Track<span id="instTrackName">—</span></label>
-      <button id="advToggleBtn" class="small" title="Advanced track editor (automation)">Advanced&hellip;</button>
       <label class="field">Waveform
         <select id="waveSel">
           <option value="square">Square (8-bit)</option>
@@ -105,10 +128,10 @@
           <option value="custom">Custom Sample</option>
         </select>
       </label>
+      <button id="advToggleBtn" class="small" title="Advanced track editor (automation)">Advanced&hellip;</button>
       <button id="uploadSampleBtn" class="small">Upload Sample&hellip;</button>
-      <span id="sampleName" style="font-size:10px; color:var(--text-dim); max-width:90px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+      <span id="sampleName" style="font-size:10px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
     </div>
-
     <div class="instSliders">
       <div class="slidergroup"><span>Volume <span class="val" id="volVal">80</span></span>
         <input type="range" id="volSlider" min="0" max="100" value="80"></div>
@@ -134,6 +157,7 @@
     </div>
   </div>
 </div>
+<div id="arrangeDivider" class="hResizer" title="Drag to resize"></div>
 
 <!-- ================= ADVANCED TRACK EDITOR (AUTOMATION) ================= -->
 <div id="advancedEditor" class="hidden">
@@ -184,6 +208,57 @@
 <div id="dragTooltip"></div>
 <div id="toast"></div>
 
+<!-- ================= TRACK COLOR PICKER ================= -->
+<div id="colorPicker" class="hidden">
+  <div id="colorPalette"></div>
+  <button id="colorCustomBtn" class="small">Custom&hellip;</button>
+  <div id="colorCustomPanel" class="hidden">
+    <div id="colorSVWrap"><canvas id="colorSVCanvas" width="140" height="90"></canvas><div id="colorSVDot"></div></div>
+    <div id="colorHueWrap"><canvas id="colorHueCanvas" width="140" height="14"></canvas><div id="colorHueDot"></div></div>
+  </div>
+</div>
+
+<!-- ================= SAVE / EXPORT MODAL ================= -->
+<div id="exportModal" class="modalOverlay hidden">
+  <div class="modalBox">
+    <h3>Save Project</h3>
+    <label class="field modalField">Title
+      <input type="text" id="exportTitleInput" maxlength="80">
+    </label>
+    <label class="field modalField">File Type
+      <select id="exportTypeSel">
+        <option value="mp3">Audio (.mp3)</option>
+        <option value="wav">Audio (.wav)</option>
+        <option value="mid">MIDI (.mid)</option>
+        <option value="json">Project (.json)</option>
+      </select>
+    </label>
+    <div class="modalField loopField">
+      <label class="checkRow"><input type="checkbox" id="exportLoopChk"><span>Repeat project</span></label>
+      <label class="field loopCountField">Times
+        <input type="number" id="exportLoopCount" min="2" max="64" value="2" disabled>
+      </label>
+    </div>
+    <div id="exportStatus" class="modalStatus"></div>
+    <div class="modalActions">
+      <button id="exportCancelBtn">Cancel</button>
+      <button id="exportConfirmBtn" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== INFO DIALOG (e.g. "looping doesn't apply to this file type") ===== -->
+<div id="infoModal" class="modalOverlay hidden">
+  <div class="modalBox">
+    <h3 id="infoTitle">Heads up</h3>
+    <div id="infoBody" class="modalStatus"></div>
+    <div class="modalActions">
+      <button id="infoOkBtn" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<script src="lamejs.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

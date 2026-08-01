@@ -31,14 +31,25 @@ function rowIndexToMidi(rowIndex, totalRows){ // row 0 = top = highest pitch
    STATE
    ====================================================================== */
 let state = {
-  bpm:120, timeSig:[4,4], key:"C", mode:"Major", octaveFocus:4, noteLenSteps:4,
+  bpm:120, timeSig:[4,4], key:"C", mode:"Major", octaveFocus:4, noteLenSteps:4, projectTitle:"Bit Beats Project",
   tracks: [], selectedTrackId:null, clipboard:[], trackClipboard:null, playing:false, playStartStep:0,
   loop:{enabled:false, start:0, end:16}, advancedTrackId:null, advancedParam:"volume",
   metronomeOn:false, holdPositionOnPause:false
 };
 let selectedNoteIds = new Set();
-let selectedRegionIds = new Set(); // shift-selected split-region blocks in the arrange timeline
+let selectedRegionIds = new Set(); // shift-selected split-region blocks in the track list
 let selectedAutoPointIds = new Set(); // selected automation dots in the advanced track editor
+// {step,row} of an empty grid cell "selected" via double-click, purely for keyboard navigation — lets
+// arrow keys explore empty cells without creating or moving any real note. Mutually exclusive with
+// selectedNoteIds: entering/exiting always keeps exactly one of the two non-empty (never both)
+let phantomSelection = null;
+// tracks a note that was just placed by a single, un-dragged click on an empty cell — a genuine
+// double-click on empty space fires that same placement (via the first click) followed immediately by
+// this dblclick handler seeing a "hit" note that only exists because of it. Within a short window this
+// is treated as a no-op double-click on empty space (toggling phantom mode) rather than a real
+// double-click-to-delete of a pre-existing note.
+let justPlacedNoteId = null, justPlacedAt = 0;
+const JUST_PLACED_WINDOW_MS = 700;
 let nextTrackId=1, nextNoteId=1;
 let editContext = "notes"; // "notes" or "track" — decides what Ctrl+C/Ctrl+V act on
 // throttles Ctrl+V so holding/mashing it can't fire dozens of paste-and-rerender cycles a second
@@ -108,8 +119,8 @@ function restoreSnapshot(snap){
     buildChain(track);
     return track;
   });
-  selectedNoteIds.clear(); selectedRegionIds.clear(); selectedAutoPointIds.clear();
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
+  selectedNoteIds.clear(); selectedRegionIds.clear(); selectedAutoPointIds.clear(); phantomSelection = null;
+  renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList(); renderAdvancedEditor();
   recomputeStepsTotal();
 }
 function undo(){
@@ -139,21 +150,28 @@ function makeReverbBuffer(seconds){
 }
 const reverbBuffer = makeReverbBuffer(2.2);
 
-// build (or rebuild) a track's persistent audio chain: input -> eq -> reverb send/dry -> pan -> master
-function buildChain(track){
-  const eqLow = actx.createBiquadFilter(); eqLow.type="lowshelf"; eqLow.frequency.value=320;
-  const eqMid = actx.createBiquadFilter(); eqMid.type="peaking"; eqMid.frequency.value=1200; eqMid.Q.value=0.9;
-  const eqHigh = actx.createBiquadFilter(); eqHigh.type="highshelf"; eqHigh.frequency.value=3200;
-  const input = actx.createGain();
-  const dry = actx.createGain(), wet = actx.createGain();
-  const conv = actx.createConvolver(); conv.buffer = reverbBuffer;
-  const trackOut = actx.createGain();
-  const panNode = actx.createStereoPanner();
+// builds one track-shaped audio graph (input -> eq -> reverb send/dry -> pan -> destination) on
+// whichever context/destination/reverb impulse it's given — shared by the live per-track chain
+// (buildChain, below) and by offline rendering for WAV export, which can't reuse actx's own nodes
+// since every node in a graph must belong to the same (Offline)AudioContext as its destination
+function makeChain(ctx, reverbBuf, destination){
+  const eqLow = ctx.createBiquadFilter(); eqLow.type="lowshelf"; eqLow.frequency.value=320;
+  const eqMid = ctx.createBiquadFilter(); eqMid.type="peaking"; eqMid.frequency.value=1200; eqMid.Q.value=0.9;
+  const eqHigh = ctx.createBiquadFilter(); eqHigh.type="highshelf"; eqHigh.frequency.value=3200;
+  const input = ctx.createGain();
+  const dry = ctx.createGain(), wet = ctx.createGain();
+  const conv = ctx.createConvolver(); conv.buffer = reverbBuf;
+  const trackOut = ctx.createGain();
+  const panNode = ctx.createStereoPanner();
   input.connect(eqLow); eqLow.connect(eqMid); eqMid.connect(eqHigh);
   eqHigh.connect(dry); dry.connect(trackOut);
   eqHigh.connect(conv); conv.connect(wet); wet.connect(trackOut);
-  trackOut.connect(panNode); panNode.connect(masterGain);
-  track._chain = {input,eqLow,eqMid,eqHigh,dry,wet,trackOut,panNode};
+  trackOut.connect(panNode); panNode.connect(destination);
+  return {input,eqLow,eqMid,eqHigh,dry,wet,trackOut,panNode};
+}
+// build (or rebuild) a track's persistent audio chain: input -> eq -> reverb send/dry -> pan -> master
+function buildChain(track){
+  track._chain = makeChain(actx, reverbBuffer, masterGain);
   applyInstrumentToChain(track);
 }
 function applyInstrumentToChain(track){
@@ -234,11 +252,17 @@ function getNoiseBuffer(){
 // every currently-sounding voice, so playback can be cut dead on pause/stop instead of letting
 // already-scheduled envelopes/oscillators ring out to their natural end
 let activeVoices = [];
-function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bendEndSec){
-  if(!track._chain) buildChain(track);
+// renderCtx (optional) lets offline WAV export reuse this exact synthesis logic against an
+// OfflineAudioContext + its own per-track chain, instead of the live actx/track._chain — every node
+// in a graph must belong to the same (Offline)AudioContext as its destination, so live playback and
+// export can't share actual nodes, only this function's logic
+function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bendEndSec, renderCtx){
+  const ctx = renderCtx ? renderCtx.ctx : actx;
+  if(!renderCtx && !track._chain) buildChain(track);
+  const chain = renderCtx ? renderCtx.chain : track._chain;
   const inst = track.instrument;
-  const env = actx.createGain();
-  env.connect(track._chain.input);
+  const env = ctx.createGain();
+  env.connect(chain.input);
   const atk = Math.max(0.001, inst.attack/1000), rel = Math.max(0.005, inst.release/1000);
   const peak = 0.5*inst.volume;
   env.gain.setValueAtTime(0,startTime);
@@ -256,7 +280,7 @@ function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bend
   let source;
 
   if(inst.wave==="custom" && inst.customBuffer){
-    const src = actx.createBufferSource(); src.buffer = inst.customBuffer;
+    const src = ctx.createBufferSource(); src.buffer = inst.customBuffer;
     src.playbackRate.setValueAtTime(Math.pow(2,(midi-inst.customBaseMidi)/12), startTime);
     if(hasBend){
       src.playbackRate.setValueAtTime(Math.pow(2,(midi-inst.customBaseMidi)/12), bendAt);
@@ -265,8 +289,8 @@ function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bend
     src.connect(env); src.start(startTime); src.stop(stopAt);
     source = src;
   } else if(inst.wave==="noise"){
-    const src = actx.createBufferSource(); src.buffer = getNoiseBuffer(); src.loop=true;
-    const bp = actx.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=1.2;
+    const src = ctx.createBufferSource(); src.buffer = renderCtx ? renderCtx.noiseBuffer : getNoiseBuffer(); src.loop=true;
+    const bp = ctx.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=1.2;
     bp.frequency.setValueAtTime(midiToFreq(midi)*2, startTime);
     if(hasBend){
       bp.frequency.setValueAtTime(midiToFreq(midi)*2, bendAt);
@@ -277,11 +301,11 @@ function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bend
     source = src;
   } else if(inst.wave==="pulse25" || inst.wave==="pulse12"){
     // approximate pulse wave via two detuned sawtooths (poor-man's PWM) -> simpler: use square with custom periodic wave
-    const osc = actx.createOscillator();
+    const osc = ctx.createOscillator();
     const real = new Float32Array(16), imag = new Float32Array(16);
     const duty = inst.wave==="pulse25"?0.25:0.125;
     for(let n=1;n<16;n++){ real[n]=0; imag[n]=(2/(n*Math.PI))*Math.sin(n*Math.PI*duty); }
-    const wave = actx.createPeriodicWave(real,imag,{disableNormalization:false});
+    const wave = ctx.createPeriodicWave(real,imag,{disableNormalization:false});
     osc.setPeriodicWave(wave);
     osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
     if(hasBend){
@@ -291,7 +315,7 @@ function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bend
     osc.connect(env); osc.start(startTime); osc.stop(stopAt);
     source = osc;
   } else {
-    const osc = actx.createOscillator();
+    const osc = ctx.createOscillator();
     osc.type = inst.wave;
     osc.frequency.setValueAtTime(midiToFreq(midi), startTime);
     if(hasBend){
@@ -302,6 +326,7 @@ function playNote(track, midi, startTime, durSec, bendToMidi, bendDelaySec, bend
     source = osc;
   }
 
+  if(renderCtx) return; // offline render: no live-voice bookkeeping needed, nothing to silence early
   // opportunistic cleanup of long-finished voices, so this array doesn't grow unbounded over a long session
   activeVoices = activeVoices.filter(v=> v.stopAt > actx.currentTime);
   activeVoices.push({env, source, stopAt});
@@ -438,15 +463,15 @@ function renderPlayheads(){
   // Positioned via transform, not left: a sticky element sticks whichever axis has a non-auto inset,
   // so setting `left` here would also freeze the grip horizontally once the grid scrolled underneath it.
   document.getElementById("playheadGrip").style.transform = "translateX("+x+"px)";
-  document.getElementById("playheadOverview").style.left = (step/stepsPerBar()*BAR_PX) +"px";
-  positionOverviewFlag();
+  document.getElementById("trackListPlayhead").style.left = (step/stepsPerBar()*BAR_PX) +"px";
+  positionTrackListFlag();
 }
 
 // keeps the little playhead flag pinned to whatever row is currently scrolled to the top of the
 // arrange view (like the ruler), instead of staying anchored to the top of the full scrollable content
-function positionOverviewFlag(){
-  const flag = document.getElementById("playheadOverviewFlag");
-  const tc = document.getElementById("timelineCol");
+function positionTrackListFlag(){
+  const flag = document.getElementById("trackListPlayheadFlag");
+  const tc = document.getElementById("trackListCol");
   if(!flag || !tc) return;
   const step = currentPlayStep();
   flag.style.left = (step/stepsPerBar()*BAR_PX - 6) + "px";
@@ -570,7 +595,7 @@ function drawGridRuler(){
 // grow the timeline (grid + ruler) to keep some empty room past whatever the furthest note/track content reaches —
 // never shrinks back on its own, so the ruler/grid never "run out" as parts extend beyond the original 16 bars
 // if a track has been split into regions, make sure a newly-added note always falls inside one —
-// growing the nearest region to cover it rather than leaving the note invisible in the overview
+// growing the nearest region to cover it rather than leaving the note invisible in the track list
 function extendRegionsForNote(track, note){
   if(!track.regions || !track.regions.length) return;
   if(track.regions.some(r=> note.step>=r.start && note.step<r.end)) return;
@@ -591,7 +616,7 @@ function recomputeStepsTotal(){
   if(needed > STEPS_TOTAL){
     STEPS_TOTAL = needed;
     sizeGrid();
-    buildOverview();
+    buildTrackList();
   }
 }
 
@@ -737,59 +762,258 @@ function renderNotes(){
     }
   });
 
+  if(phantomSelection){
+    const pdiv = document.createElement("div");
+    pdiv.id = "phantomCell";
+    pdiv.style.left = (phantomSelection.step*STEP_W+1)+"px";
+    pdiv.style.top = (phantomSelection.row*ROW_H+1)+"px";
+    // the ghost spans the current Note Length, matching the duration a plain click would place
+    pdiv.style.width = (state.noteLenSteps*STEP_W-2)+"px";
+    pdiv.style.height = (ROW_H-2)+"px";
+    noteLayer.appendChild(pdiv);
+  }
+
   // keep the advanced editor's ghost note tiles live instead of only refreshing on open/close —
   // cheap enough (small canvas) to just redraw every time the piano roll's notes change
   if(state.advancedTrackId!=null) renderAdvancedEditor();
 }
 
 /* ======================================================================
-   TRACK LIST + ARRANGE OVERVIEW
+   INSTRUMENT LIST (left panel) + TRACK LIST (right panel)
    ====================================================================== */
-const BAR_PX = 60;
+let BAR_PX = 60; // track-list horizontal zoom — pixels per bar (independent of vertical row shrink)
+let TRACK_ROW_H = 46; // shared instrument-row / track-row height — independent of BAR_PX (vertical vs horizontal zoom)
+const TRACK_ROW_MIN = 34, TRACK_ROW_MAX = 90;
+// Row shrink is graduated rather than a single binary "compact" flip:
+//   H >= TRACK_ROW_PATTERN_MIN : full card — name header, controls row beneath it, note-pattern preview
+//   TRACK_ROW_COMPACT_MAX < H  : same two-row layout, but no room left for the pattern preview
+//   H <= TRACK_ROW_COMPACT_MAX : single line — controls move to the RIGHT of the name (never hidden);
+//                                the name truncates and the waveform select abbreviates to make room
+const TRACK_ROW_COMPACT_MAX = 45;
+const TRACK_ROW_PATTERN_MIN = 54;
+const TRACK_ROW_HDR_H = 22; // instrument-row name strip's height on full-size rows
+// track-preview blocks: inset from their row's top/bottom, with an opaque colored header strip
+// (mirroring #advLaneHeader) over a translucent body
+const TRACK_BLOCK_INSET = 3;
+const TRACK_BLOCK_HDR_H = 14;
+const BAR_PX_MIN = 20, BAR_PX_MAX = 200;
 function refreshArrangeGridBg(){
-  document.querySelectorAll(".timelineRow").forEach(r=> r.style.setProperty("--barpx", BAR_PX+"px"));
+  document.querySelectorAll(".trackRow").forEach(r=> r.style.setProperty("--barpx", BAR_PX+"px"));
+}
+function setTrackRowHeight(h){
+  TRACK_ROW_H = Math.max(TRACK_ROW_MIN, Math.min(TRACK_ROW_MAX, Math.round(h)));
+  renderInstrumentList();
+}
+function setTrackZoom(px){
+  BAR_PX = Math.max(BAR_PX_MIN, Math.min(BAR_PX_MAX, Math.round(px)));
+  buildTrackList();
 }
 
-function renderTrackList(){
-  const list = document.getElementById("trackList");
+// translucent variant of a track color for the row body (the opaque header keeps the raw color)
+function colorWithAlpha(color, a){
+  if(typeof color==="string" && /^#?[0-9a-f]{6}$/i.test(color)){
+    const [r,g,b] = hexToRgb(color);
+    return "rgba("+r+","+g+","+b+","+a+")";
+  }
+  return color; // non-hex (named/rgb) colors: fall back to the raw value rather than mangling it
+}
+
+function renderInstrumentList(){
+  const list = document.getElementById("instrumentList");
+  // this function rebuilds the list's DOM from scratch, which resets its scroll container to the top —
+  // stash and restore the scroll offset so unrelated rerenders (mute/solo/rename/volume) don't yank
+  // the user back to the first instrument. selectTrack() overrides this with a centering scroll.
+  const scroller = document.getElementById("instrumentListScroll");
+  const keepScrollTop = scroller ? scroller.scrollTop : 0;
   list.innerHTML="";
+  const oneline = TRACK_ROW_H<=TRACK_ROW_COMPACT_MAX;
+  const showPattern = TRACK_ROW_H>=TRACK_ROW_PATTERN_MIN;
+  const hdrH = oneline ? TRACK_ROW_H-1 : TRACK_ROW_HDR_H;
   state.tracks.forEach(track=>{
     const row = document.createElement("div");
-    row.className="trackRow"+(track.id===state.selectedTrackId?" selected":"");
+    row.className="instrumentRow"+(track.id===state.selectedTrackId?" selected":"")+(oneline?" oneline":"");
     row.dataset.id = track.id;
+    row.style.height = TRACK_ROW_H+"px";
+    row.style.setProperty("--hdrh", hdrH+"px");
+    // the name is plain text until double-clicked (see the dblclick handler on #instrumentList),
+    // which swaps in a bordered <input> for the duration of the edit
     row.innerHTML = `
+      <canvas class="instrumentRowPattern"></canvas>
       <div class="tname"><span class="swatch" style="background:${track.color}"></span>
-        <input type="text" value="${escapeHtml(track.name)}" data-role="name"></div>
+        <span class="nameText" data-role="nameText" title="Double-click to rename">${escapeHtml(track.name)}</span></div>
       <div class="tctrls">
         <button class="mutebtn ${track.muted?'on':''}" data-role="mute">M</button>
         <button class="solobtn ${track.solo?'on':''}" data-role="solo">S</button>
-        <select data-role="wave" style="flex:1; font-size:10px; padding:1px 2px;">
+        <select data-role="wave">
           <option value="square">Square</option><option value="pulse25">Pulse25</option>
           <option value="pulse12">Pulse12</option><option value="triangle">Triangle</option>
           <option value="sawtooth">Saw</option><option value="sine">Sine</option>
           <option value="noise">Noise</option><option value="custom">Custom</option>
         </select>
-        <input type="range" data-role="vol" min="0" max="100" value="${Math.round(track.volume*100)}" style="width:40px;">
+        <input type="range" data-role="vol" min="0" max="100" value="${Math.round(track.volume*100)}">
       </div>`;
     row.querySelector('[data-role=wave]').value = track.instrument.wave;
+    const pattern = row.querySelector(".instrumentRowPattern");
+    if(!showPattern) pattern.remove();
     list.appendChild(row);
+    if(showPattern) drawInstrumentRowPattern(track, pattern);
   });
-  buildOverview();
+  // second pass, after the rows are in the document and have a measurable layout
+  list.querySelectorAll(".instrumentRow").forEach(row=>{
+    sizeNameInput(row.querySelector('[data-role=nameText], input[data-role=name]'));
+    fitRowControls(row);
+  });
+  if(scroller) scroller.scrollTop = keepScrollTop;
+  buildTrackList();
+}
+// scrolls the instrument list so the selected row sits in the middle of the visible area, clamped to
+// the real scroll range (so the first/last rows just sit at the top/bottom rather than being forced
+// past the ends). Called after the list has been rebuilt, since rebuilding resets scrollTop.
+function centerSelectedInstrumentRow(opts){
+  const scroller = document.getElementById("instrumentListScroll");
+  if(!scroller || state.selectedTrackId==null) return;
+  const row = scroller.querySelector('.instrumentRow[data-id="'+state.selectedTrackId+'"]');
+  if(!row) return;
+  if(opts && opts.onlyIfOffscreen){
+    const r = row.getBoundingClientRect(), v = scroller.getBoundingClientRect();
+    // the sticky header spacer covers the top of the viewport, so "visible" starts below it
+    const spacerH = (document.getElementById("instrumentListHeaderSpacer")||{offsetHeight:0}).offsetHeight;
+    if(r.top >= v.top+spacerH-0.5 && r.bottom <= v.bottom+0.5) return;
+  }
+  // measured rather than derived from offsetTop: neither #instrumentListScroll nor #instrumentList is
+  // a positioned element, so offsetParent would be the body and offsetTop would be page-relative
+  const rowRect = row.getBoundingClientRect(), viewRect = scroller.getBoundingClientRect();
+  const rowTopInContent = rowRect.top - viewRect.top + scroller.scrollTop;
+  const target = rowTopInContent - (scroller.clientHeight - rowRect.height)/2;
+  scroller.scrollTop = Math.max(0, Math.min(scroller.scrollHeight - scroller.clientHeight, target));
 }
 function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
 
-function buildOverview(){
-  const inner = document.getElementById("timelineInner");
+/* ---------- name box sizes itself to its text (no wide empty click strip) ---------- */
+let _measureCtx = null;
+function measureTextPx(text, font){
+  if(!_measureCtx) _measureCtx = document.createElement("canvas").getContext("2d");
+  _measureCtx.font = font;
+  return _measureCtx.measureText(text).width;
+}
+// works for both states of the name box: the plain <span> shown normally and the <input> swapped in
+// while it's being edited (see beginNameEdit) — both need the same measured, text-hugging width
+function sizeNameInput(el){
+  if(!el) return;
+  const cs = getComputedStyle(el);
+  const text = (el.tagName==="INPUT" ? el.value : el.textContent) || " ";
+  const w = measureTextPx(text, cs.fontStyle+" "+cs.fontWeight+" "+cs.fontSize+" "+cs.fontFamily);
+  const pad = (parseFloat(cs.paddingLeft)||0) + (parseFloat(cs.paddingRight)||0)
+            + (parseFloat(cs.borderLeftWidth)||0) + (parseFloat(cs.borderRightWidth)||0);
+  const natural = Math.max(10, Math.ceil(w+pad)+3);
+  // max-width:100% + flex-shrink still let this give up space to the controls when the row is tight,
+  // so the *rendered* width is not a usable measurement — stash the unsqueezed one for fitRowControls
+  el.dataset.natw = String(natural);
+  if(el.tagName==="INPUT") el.style.width = natural+"px";
+}
+
+/* ---------- waveform <select> progressive abbreviation ----------
+   Tier 0 = full word ("Square"), 1 = first letter only ("S"), 2 = no text at all (bare dropdown arrow).
+   A plain <select> renders whatever text the *selected* <option> holds, so abbreviating means
+   rewriting that option's label; the original is stashed in data-full and restored whenever the
+   popup is about to open (mousedown/focus) so the list itself always reads in full words. */
+function applyWaveTier(sel, tier){
+  if(!sel) return;
+  Array.prototype.forEach.call(sel.options, o=>{
+    if(o.dataset.full===undefined) o.dataset.full = o.textContent;
+    o.textContent = o.dataset.full;
+  });
+  const opt = sel.selectedOptions && sel.selectedOptions[0];
+  if(opt){
+    if(tier===1) opt.textContent = (opt.dataset.full||"").charAt(0);
+    else if(tier>=2) opt.textContent = "";
+  }
+  sel.classList.toggle("wtier1", tier===1);
+  sel.classList.toggle("wtier2", tier>=2);
+}
+// shrink the waveform label (and, last resort, the volume slider) until the controls fit beside the name
+function fitRowControls(row){
+  if(!row) return;
+  const ctrls = row.querySelector(".tctrls"), name = row.querySelector(".tname");
+  const sel = ctrls && ctrls.querySelector('select[data-role=wave]');
+  const vol = ctrls && ctrls.querySelector('input[data-role=vol]');
+  if(!ctrls || !name || !sel) return;
+  if(!row.classList.contains("oneline")){
+    sel.dataset.wtier = "0"; applyWaveTier(sel, 0);
+    if(vol) vol.classList.remove("volNarrow");
+    return;
+  }
+  if(vol) vol.classList.remove("volNarrow");
+  // natural (unshrunk) width the name wants: left padding + swatch + gap + measured text.
+  // name.scrollWidth would be useless here — the flex shrink has already squashed the input.
+  const nameEl = name.querySelector('[data-role=nameText], input[data-role=name]');
+  const nameNeed = 8 + 9 + 6 + (nameEl ? Number(nameEl.dataset.natw||0) : 0);
+  const avail = row.clientWidth;
+  let tier = 0;
+  for(tier=0; tier<=2; tier++){
+    applyWaveTier(sel, tier);
+    if(nameNeed + ctrls.offsetWidth <= avail) break;
+  }
+  if(tier>2) tier = 2;
+  sel.dataset.wtier = String(tier);
+  if(tier===2 && vol && nameNeed + ctrls.offsetWidth > avail) vol.classList.add("volNarrow");
+}
+
+// mini note-pattern preview painted behind an instrument-list row's own controls, echoing the ghost note
+// tiles drawn in the advanced track editor (renderAdvancedEditor) and the track list's blocks
+// (renderTrackBlock) — scaled to the row's own measured size rather than a fixed lane/block width
+function drawInstrumentRowPattern(track, canvas){
+  if(!canvas) return;
+  // measure the row (canvas's positioned container), not the canvas itself — an absolutely positioned
+  // replaced element with auto width/height falls back to its own intrinsic (bitmap) size instead of
+  // the stretched CSS size, so reading canvas.clientWidth here would create a runaway feedback loop
+  // where each redraw re-derives its target size from the previous draw's bitmap size
+  const row = canvas.parentElement;
+  const w = row ? row.clientWidth : canvas.clientWidth, h = row ? row.clientHeight : canvas.clientHeight;
+  const dpr = window.devicePixelRatio||1;
+  canvas.width = Math.max(1,Math.round(w*dpr)); canvas.height = Math.max(1,Math.round(h*dpr));
+  canvas.style.width = w+"px"; canvas.style.height = h+"px";
+  const ctx = canvas.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  if(!track.notes.length || w<=0 || h<=0) return;
+  const pitches = track.notes.map(n=>n.pitch);
+  const minP = Math.min(...pitches), maxP = Math.max(...pitches);
+  const range = Math.max(1, maxP-minP);
+  const padV = 3, padH = 4;
+  const tileH = Math.min(8, Math.max(2, (h-padV*2)/(range+2)));
+  const travel = Math.max(2, h-padV*2-tileH);
+  const totalSteps = Math.max(1, STEPS_TOTAL);
+  // instrument rows are plain/dark again (the track-colored treatment moved to the track-preview
+  // blocks), so the pattern reads best as the track's own color rather than the dark tile used
+  // against a color-washed background
+  ctx.fillStyle = colorWithAlpha(track.color, 0.5);
+  ctx.globalAlpha = 0.85;
+  track.notes.forEach(n=>{
+    const nx = padH + (n.step/totalSteps)*(w-padH*2);
+    const nw = Math.max(1, (n.dur/totalSteps)*(w-padH*2));
+    const t = (n.pitch-minP)/range;
+    const centerY = (h-padV-tileH/2) - t*travel;
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(nx, centerY-tileH/2, nw, tileH, 1); else ctx.rect(nx, centerY-tileH/2, nw, tileH);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+}
+
+function buildTrackList(){
+  const inner = document.getElementById("trackListInner");
   inner.innerHTML = "";
   const loopBar = document.createElement("div"); loopBar.id="loopBar";
   loopBar.innerHTML = '<div id="loopRegion"><div id="loopHandleL" class="loopHandle"></div><div id="loopHandleR" class="loopHandle"></div></div>';
   inner.appendChild(loopBar);
-  const ruler = document.createElement("div"); ruler.id="arrangeRuler"; inner.appendChild(ruler);
-  const ph = document.createElement("div"); ph.id="playheadOverview"; inner.appendChild(ph);
-  const flag = document.createElement("div"); flag.id="playheadOverviewFlag"; inner.appendChild(flag);
+  const ruler = document.createElement("div"); ruler.id="trackListRuler"; inner.appendChild(ruler);
+  const ph = document.createElement("div"); ph.id="trackListPlayhead"; inner.appendChild(ph);
+  const flag = document.createElement("div"); flag.id="trackListPlayheadFlag"; inner.appendChild(flag);
+  const showPattern = TRACK_ROW_H>=TRACK_ROW_PATTERN_MIN;
   state.tracks.forEach(track=>{
     const row = document.createElement("div");
-    row.className="timelineRow"; row.style.setProperty("--barpx",BAR_PX+"px");
+    row.className="trackRow"; row.style.setProperty("--barpx",BAR_PX+"px");
+    row.style.height = TRACK_ROW_H+"px";
     row.dataset.id = track.id;
     if(track.regions && track.regions.length){
       // split into independent regions: each renders as its own block, but all still belong to this one track
@@ -805,6 +1029,10 @@ function buildOverview(){
       renderTrackBlock(row, track, startBar, endBar, track.notes, null);
     }
     inner.appendChild(row);
+    if(showPattern){
+      const listRow = document.querySelector('.instrumentRow[data-id="'+track.id+'"]');
+      if(listRow) drawInstrumentRowPattern(track, listRow.querySelector(".instrumentRowPattern"));
+    }
   });
   const totalW = (STEPS_TOTAL/stepsPerBar()*BAR_PX+40);
   inner.style.width = totalW+"px";
@@ -813,46 +1041,58 @@ function buildOverview(){
   renderLoopUI();
 }
 
-// renders one overview block spanning [startStep,endStep) in a track's timeline row, with a mini note-pattern preview
+// renders one track block spanning [startStep,endStep) in a track's row of the track list, with a mini note-pattern preview
 function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
   const spb = stepsPerBar();
   const left = startStep/spb*BAR_PX;
   const blockW = Math.max(20, (endStep-startStep)/spb*BAR_PX);
+  // the block is an opaque track-colored header strip (carrying the name) over a translucent
+  // track-colored body — the treatment that used to live on the instrument-list rows
+  const blockH = Math.max(16, TRACK_ROW_H - 1 - TRACK_BLOCK_INSET*2);
+  const hdrH = Math.min(TRACK_BLOCK_HDR_H, Math.max(9, Math.round(blockH*0.45)));
+  const bodyH = Math.max(0, blockH-hdrH);
   const block = document.createElement("div");
-  block.className = "overviewBlock"+(regionId!=null && selectedRegionIds.has(regionId) ? " regionSelected" : "");
+  block.className = "trackBlock"+(regionId!=null && selectedRegionIds.has(regionId) ? " regionSelected" : "");
   block.style.left = left+"px";
+  block.style.top = TRACK_BLOCK_INSET+"px";
   block.style.width = blockW+"px";
+  block.style.height = blockH+"px";
   block.style.boxSizing = "border-box";
-  block.style.background = track.color;
-  block.style.color = "#111";
+  block.style.background = colorWithAlpha(track.color, 0.35);
   if(regionId!=null) block.dataset.regionId = regionId;
 
+  const header = document.createElement("div");
+  header.className = "trackBlockHeader";
+  header.style.height = hdrH+"px";
+  header.style.background = track.color;
+  header.style.fontSize = (hdrH<12 ? 8 : 10)+"px";
+  header.textContent = track.name;
+  block.appendChild(header);
+
   const pattern = document.createElement("canvas");
-  const blockH = 34, dpr = window.devicePixelRatio||1;
-  pattern.width = blockW*dpr; pattern.height = blockH*dpr;
-  pattern.style.position="absolute"; pattern.style.left="0"; pattern.style.top="0";
-  pattern.style.width=blockW+"px"; pattern.style.height=blockH+"px"; pattern.style.zIndex="0";
+  const dpr = window.devicePixelRatio||1;
+  pattern.className = "trackBlockPattern";
+  pattern.width = Math.max(1, Math.round(blockW*dpr)); pattern.height = Math.max(1, Math.round(bodyH*dpr));
+  pattern.style.top = hdrH+"px";
+  pattern.style.width=blockW+"px"; pattern.style.height=bodyH+"px";
   const pctx = pattern.getContext("2d"); pctx.scale(dpr,dpr);
-  if(notes.length){
+  if(notes.length && bodyH>3){
     const totalSteps = Math.max(1, endStep-startStep);
     const pitches = notes.map(n=>n.pitch);
     const minP = Math.min(...pitches), maxP = Math.max(...pitches);
     const range = Math.max(1, maxP-minP);
+    const padV = Math.min(3, Math.floor(bodyH/4));
+    const travel = Math.max(1, bodyH-padV*2-2);
     pctx.fillStyle = "rgba(0,0,0,.55)";
     notes.forEach(n=>{
       const nx = (n.step-startStep)/totalSteps*blockW;
       const nw = Math.max(1, n.dur/totalSteps*blockW-0.5);
       const t = (n.pitch-minP)/range;
-      const ny = (blockH-6) - t*(blockH-12);
+      const ny = (bodyH-padV-2) - t*travel;
       pctx.fillRect(nx, ny, nw, 2);
     });
   }
   block.appendChild(pattern);
-
-  const label = document.createElement("span");
-  label.textContent = track.name;
-  label.style.position="relative"; label.style.zIndex="1"; label.style.pointerEvents="none";
-  block.appendChild(label);
 
   // edge grips so the block's span can be trimmed from either side, mirroring the note tile's
   // left/right resize handles — for a track with no regions yet, grabbing an edge lazily turns its
@@ -871,9 +1111,9 @@ function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
   row.appendChild(block);
 }
 
-// bar-number ruler above the arrange timeline, marking measure boundaries
+// bar-number ruler above the track list, marking measure boundaries
 function renderArrangeRuler(totalW){
-  const ruler = document.getElementById("arrangeRuler");
+  const ruler = document.getElementById("trackListRuler");
   if(!ruler) return;
   const h = 18, dpr = window.devicePixelRatio||1;
   const canvas = document.createElement("canvas");
@@ -954,7 +1194,7 @@ function renderAdvancedEditor(){
   const ctx = canvas.getContext("2d"); ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,laneW,ADV_LANE_H);
 
-  // solid track-colored backdrop, echoing the arrange overview block's own coloring (and the lane header above it)
+  // solid track-colored backdrop, echoing the track block's own coloring (and the lane header above it)
   ctx.fillStyle = track.color; ctx.globalAlpha = 0.4; ctx.fillRect(0,0,laneW,ADV_LANE_H); ctx.globalAlpha = 1;
 
   const points = track.automation[state.advancedParam].slice().sort((a,b)=>a.step-b.step);
@@ -962,7 +1202,7 @@ function renderAdvancedEditor(){
   const stepToX = s=> s/spb*BAR_PX;
 
   // ghost note tiles from the track's own notes, positioned by step/duration and pitch —
-  // same idea as the mini note-pattern drawn inside the arrange overview's track blocks,
+  // same idea as the mini note-pattern drawn inside the track list's blocks,
   // just scaled to fill the full lane so you can see notes against the automation curve
   if(track.notes.length){
     const pitches = track.notes.map(n=>n.pitch);
@@ -971,10 +1211,18 @@ function renderAdvancedEditor(){
     const tileH = Math.min(16, Math.max(6, ADV_LANE_H/(range+4)));
     const padV = 8; // keeps tiles off the lane's own top/bottom edge, independent of the card's own outer inset
     const travel = Math.max(4, ADV_LANE_H - padV*2 - tileH);
+    // Horizontal padding is applied as a real SCALE, not a flat offset: the lane's full x range is
+    // squeezed into [PAD_H, laneW-PAD_H], so tiles near the very start and the very end both keep the
+    // same breathing room instead of a late tile being shoved past the right edge and clamped/squashed.
+    // The curve and its drag-points keep the unscaled stepToX space, so interaction is untouched.
+    const PAD_H = 6;
+    const innerW = Math.max(1, laneW - PAD_H*2);
+    const scaleX = innerW/Math.max(1, laneW);
+    const tileX = s=> PAD_H + stepToX(s)*scaleX;
     ctx.fillStyle = "rgba(216,255,230,.55)"; // near-white mint green, echoing the accent color
     track.notes.forEach(n=>{
-      const nx = stepToX(n.step);
-      const nw = Math.max(2, stepToX(n.step+n.dur)-nx-1);
+      const nx = Math.max(PAD_H, Math.min(tileX(n.step), laneW-PAD_H-2));
+      const nw = Math.max(2, Math.min(tileX(n.step+n.dur)-tileX(n.step)-1, laneW-PAD_H-nx));
       const t = (n.pitch-minP)/range;
       const centerY = (ADV_LANE_H-padV-tileH/2) - t*travel;
       ctx.beginPath();
@@ -1097,7 +1345,13 @@ function selectTrack(id, opts){
   state.selectedTrackId = id;
   editContext = "track";
   selectedNoteIds.clear();
-  renderTrackList(); refreshInstrumentEditor(); renderNotes();
+  phantomSelection = null;
+  renderInstrumentList(); refreshInstrumentEditor(); renderNotes();
+  // renderInstrumentList() rebuilds the list from scratch (which would otherwise reset its scroll
+  // container to the very first instrument) — bring the newly selected row back into the middle of
+  // the view. Rows that are already fully visible are left alone, so ordinary clicking doesn't make
+  // the list lurch under the cursor mid-gesture (e.g. between the two clicks of a rename).
+  centerSelectedInstrumentRow({onlyIfOffscreen:true});
   if(opts && opts.scrollToFirstNote) scrollGridToFirstNote(id);
 }
 // bring the piano roll to wherever a track's earliest note sits, with that note pinned near the left edge
@@ -1110,6 +1364,54 @@ function scrollGridToFirstNote(trackId){
   gridScroll.scrollTop = Math.max(0, row*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2);
   syncPianoScroll();
 }
+// the phantom cell spans state.noteLenSteps steps, so its start has to stop far enough from the right
+// edge that the whole span still fits inside the grid
+function clampPhantomStep(step){
+  return Math.max(0, Math.min(step, STEPS_TOTAL - state.noteLenSteps));
+}
+
+// Minimal "nudge into view" for whatever is currently selected (real notes or the phantom cell).
+// Only moves an axis that's actually out of view, and only far enough to make the offending edge flush
+// with the viewport border — never centers, never overshoots.
+//
+// Coordinate space: gridScroll.scrollTop/scrollLeft are in #gridInner's coordinate space, and #gridInner
+// reserves a real GRID_RULER_H band above the row content (see resizeGrid: height = h + GRID_RULER_H),
+// so a row's content-space top is row*ROW_H + GRID_RULER_H. On top of that #gridRuler is position:sticky
+// top:0, so it permanently covers the first GRID_RULER_H pixels of the viewport — the genuinely visible
+// vertical band is [scrollTop + GRID_RULER_H, scrollTop + clientHeight]. Both offsets cancel on the top
+// edge (boxTop - GRID_RULER_H === row*ROW_H) but not on the bottom. Horizontally there is no such band.
+function scrollSelectionIntoView(){
+  let boxLeft, boxRight, boxTop, boxBottom;
+  const track = selectedTrack();
+  if(track && selectedNoteIds.size){
+    const notes = track.notes.filter(n=>selectedNoteIds.has(n.id));
+    if(!notes.length) return;
+    notes.forEach(n=>{
+      const row = midiToRow(n.pitch);
+      const l = n.step*STEP_W, r = (n.step+n.dur)*STEP_W;
+      const t = row*ROW_H + GRID_RULER_H, b = t + ROW_H;
+      boxLeft = boxLeft==null ? l : Math.min(boxLeft, l);
+      boxRight = boxRight==null ? r : Math.max(boxRight, r);
+      boxTop = boxTop==null ? t : Math.min(boxTop, t);
+      boxBottom = boxBottom==null ? b : Math.max(boxBottom, b);
+    });
+  } else if(phantomSelection){
+    boxLeft = phantomSelection.step*STEP_W;
+    boxRight = (phantomSelection.step+state.noteLenSteps)*STEP_W;
+    boxTop = phantomSelection.row*ROW_H + GRID_RULER_H;
+    boxBottom = boxTop + ROW_H;
+  } else return;
+
+  const viewW = gridScroll.clientWidth, viewH = gridScroll.clientHeight;
+  if(boxLeft < gridScroll.scrollLeft) gridScroll.scrollLeft = boxLeft;
+  else if(boxRight > gridScroll.scrollLeft + viewW) gridScroll.scrollLeft = boxRight - viewW;
+
+  // the sticky ruler eats the top GRID_RULER_H px of the viewport, so the top edge has to clear it
+  if(boxTop - GRID_RULER_H < gridScroll.scrollTop) gridScroll.scrollTop = boxTop - GRID_RULER_H;
+  else if(boxBottom > gridScroll.scrollTop + viewH) gridScroll.scrollTop = boxBottom - viewH;
+  // gridScroll's own "scroll" listener runs syncPianoScroll() for us
+}
+
 function addTrack(){
   pushHistory();
   const t = makeTrack("Track "+nextTrackId, state.tracks.length);
@@ -1125,18 +1427,18 @@ function deleteSelectedTrack(){
   state.tracks = state.tracks.filter(t=>t.id!==track.id);
   state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
   if(state.advancedTrackId===track.id){ state.advancedTrackId=null; selectedAutoPointIds.clear(); }
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); renderAdvancedEditor();
+  renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); renderAdvancedEditor();
 }
 
 /* ======================================================================
    NOTE EDITING: click-add, drag-select, drag-move, copy/paste
    ====================================================================== */
 let drag = null; // {mode:'select'|'move'|'place', startX,startY, origin notes...}
-let playheadDrag = null; // {type:'grid'|'overview'}
+let playheadDrag = null; // {type:'grid'|'trackList'}
 let loopDrag = null; // {mode:'move'|'resizeL'|'resizeR', ...}
 let trackDrag = null; // {trackId, startX, origin}
 let blockResizeDrag = null; // {trackId, regionId, edge:'left'|'right', minBound, maxBound}
-let suppressTimelineClick = false;
+let suppressTrackListClick = false;
 
 function xyToStepRow(clientX, clientY){
   const rect = gridInner.getBoundingClientRect();
@@ -1175,16 +1477,36 @@ function noteOverlapMinStep(track, row, fixedEnd, excludeId){
 noteLayer.addEventListener("mousedown", onGridMouseDown);
 gridCanvas.addEventListener("mousedown", onGridMouseDown);
 
-// double-click a tile to delete it
+// double-click a tile to delete it; double-click empty space to toggle phantom (keyboard-only)
+// navigation of empty cells on and off
 noteLayer.addEventListener("dblclick", (e)=>{
   const track = selectedTrack(); if(!track) return;
   const {step,row} = xyToStepRow(e.clientX,e.clientY);
   const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
-  if(!hitNote) return;
+  // a double-click's own first click already ran onGridMouseDown's empty-cell "place" logic and created
+  // a note before this handler ever saw the cell — so a real double-click on originally-empty space
+  // still finds a hitNote here. Distinguish that from an intentional double-click-to-delete of a
+  // pre-existing note by checking whether this exact note was placed moments ago by this same gesture.
+  const isTransientPlacement = hitNote && hitNote.id===justPlacedNoteId
+    && (performance.now()-justPlacedAt) < JUST_PLACED_WINDOW_MS;
+  if(!hitNote || isTransientPlacement){
+    if(isTransientPlacement){
+      if(undoStack.length) undoStack.pop(); // cancel the placement's own checkpoint — net state is unchanged
+      track.notes = track.notes.filter(n=>n.id!==hitNote.id);
+      selectedNoteIds.delete(hitNote.id);
+      justPlacedNoteId = null;
+      buildTrackList(); recomputeStepsTotal();
+    }
+    phantomSelection = phantomSelection ? null : {step:clampPhantomStep(step), row};
+    renderNotes();
+    if(phantomSelection) scrollSelectionIntoView();
+    e.stopPropagation(); e.preventDefault();
+    return;
+  }
   pushHistory();
   track.notes = track.notes.filter(n=>n.id!==hitNote.id);
   selectedNoteIds.delete(hitNote.id);
-  renderNotes(); buildOverview(); recomputeStepsTotal();
+  renderNotes(); buildTrackList(); recomputeStepsTotal();
   e.stopPropagation(); e.preventDefault();
 });
 
@@ -1274,15 +1596,16 @@ function onGridMouseDown(e){
   const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
   if(hitNote){
     if(e.detail>=2){ e.preventDefault(); return; } // double-click: let the dblclick handler delete it
+    phantomSelection = null;
     // slurred tiles preview the slide itself (base pitch sliding into the target) rather than just
     // the base pitch alone, compressed into the same short preview length
     if(!state.playing) previewNote(track, hitNote.pitch, hitNote.bendTo);
     if(!selectedNoteIds.has(hitNote.id)){
       if(!e.shiftKey) selectedNoteIds.clear();
       selectedNoteIds.add(hitNote.id);
-      renderNotes();
+      renderNotes(); scrollSelectionIntoView();
     } else if(e.shiftKey){
-      selectedNoteIds.delete(hitNote.id); renderNotes(); return;
+      selectedNoteIds.delete(hitNote.id); renderNotes(); scrollSelectionIntoView(); return;
     }
     pushHistory();
     const originNotes = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null}));
@@ -1334,7 +1657,7 @@ window.addEventListener("mousemove", (e)=>{
     const track = state.tracks.find(t=>t.id===blockResizeDrag.trackId);
     const region = track && track.regions && track.regions.find(r=>r.id===blockResizeDrag.regionId);
     if(region){
-      const rect = document.getElementById("timelineInner").getBoundingClientRect();
+      const rect = document.getElementById("trackListInner").getBoundingClientRect();
       const spb = stepsPerBar();
       const stepAt = Math.round((e.clientX-rect.left)/BAR_PX*spb);
       if(blockResizeDrag.edge==="left"){
@@ -1342,12 +1665,12 @@ window.addEventListener("mousemove", (e)=>{
       } else {
         region.end = Math.min(blockResizeDrag.maxBound, Math.max(region.start+1, stepAt));
       }
-      buildOverview();
+      buildTrackList();
     }
     return;
   }
   if(loopDrag){
-    const rect = document.getElementById("timelineInner").getBoundingClientRect();
+    const rect = document.getElementById("trackListInner").getBoundingClientRect();
     const stepAt = (e.clientX-rect.left)/BAR_PX*stepsPerBar();
     if(loopDrag.mode==="resizeL"){
       state.loop.start = Math.max(0, Math.min(state.loop.end-1, Math.round(stepAt)));
@@ -1380,7 +1703,7 @@ window.addEventListener("mousemove", (e)=>{
         });
       }
       if(track.id===state.selectedTrackId) renderNotes();
-      buildOverview();
+      buildTrackList();
     }
     return;
   }
@@ -1390,7 +1713,7 @@ window.addEventListener("mousemove", (e)=>{
       const rect = gridInner.getBoundingClientRect();
       step = (e.clientX-rect.left)/STEP_W;
     } else {
-      const rect = document.getElementById("timelineInner").getBoundingClientRect();
+      const rect = document.getElementById("trackListInner").getBoundingClientRect();
       step = (e.clientX-rect.left)/BAR_PX*stepsPerBar();
     }
     state.playStartStep = Math.max(0, Math.min(STEPS_TOTAL, step));
@@ -1564,13 +1887,13 @@ window.addEventListener("mouseup", ()=>{
   if(loopDrag){ loopDrag=null; return; }
   if(trackDrag){ trackDrag=null; document.body.style.cursor=""; recomputeStepsTotal(); return; }
   if(playheadDrag){
-    if(playheadDrag.type==="overview") suppressTimelineClick = true;
+    if(playheadDrag.type==="trackList") suppressTrackListClick = true;
     playheadDrag=null;
     return;
   }
   if(drag){
-    if(drag.mode==="select") document.getElementById("selectionBox").style.display="none";
-    if(drag.mode==="move" && drag.moved){ buildOverview(); recomputeStepsTotal(); }
+    if(drag.mode==="select"){ document.getElementById("selectionBox").style.display="none"; scrollSelectionIntoView(); }
+    if(drag.mode==="move" && drag.moved){ buildTrackList(); recomputeStepsTotal(); }
     if(drag.mode==="place"){
       const track = selectedTrack();
       if(track){
@@ -1579,14 +1902,15 @@ window.addEventListener("mouseup", ()=>{
           const newNote = {id: nextNoteId++, step:drag.startStep, pitch:drag.pitch, dur, bendTo:null};
           track.notes.push(newNote);
           extendRegionsForNote(track, newNote);
+          justPlacedNoteId = newNote.id; justPlacedAt = performance.now();
           if(!state.playing) previewNote(track, drag.pitch);
           renderNotes();
         }
-        buildOverview();
+        buildTrackList();
         recomputeStepsTotal();
       }
     }
-    if(drag.mode==="bend" || drag.mode==="bendAdjust" || drag.mode==="resizeLeft"){ buildOverview(); recomputeStepsTotal(); }
+    if(drag.mode==="bend" || drag.mode==="bendAdjust" || drag.mode==="resizeLeft"){ buildTrackList(); recomputeStepsTotal(); }
   }
   drag=null; hideTooltip();
 });
@@ -1632,7 +1956,7 @@ document.addEventListener("keydown", (e)=>{
         pushHistory();
         state.tracks = state.tracks.filter(t=>t.id!==track.id);
         state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
-        renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview();
+        renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList();
         toast("Cut track \""+track.name+"\"");
       } else {
         toast("Copied track \""+track.name+"\"");
@@ -1684,7 +2008,7 @@ document.addEventListener("keydown", (e)=>{
     state.clipboard = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>({step:n.step,pitch:n.pitch,dur:n.dur,bendTo:n.bendTo??null,bendStartStep:n.bendStartStep??0,bendEndStep:n.bendEndStep??null}));
     track.notes = track.notes.filter(n=>!selectedNoteIds.has(n.id));
     selectedNoteIds.clear();
-    renderNotes(); buildOverview();
+    renderNotes(); buildTrackList();
     toast("Cut "+state.clipboard.length+" note(s)");
     e.preventDefault();
   } else if(editContext==="notes" && (e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="v"){
@@ -1692,7 +2016,13 @@ document.addEventListener("keydown", (e)=>{
     if(pasteOnCooldown()){ e.preventDefault(); return; }
     pushHistory();
     const minStep = Math.min(...state.clipboard.map(n=>n.step));
-    const pasteAt = Math.round(currentPlayStep());
+    // if the current selection is still on this track (e.g. right after a copy, or after a prior
+    // paste made the pasted notes the selection), anchor the new paste immediately to its right so
+    // repeated Ctrl+V walks a copy rightward instead of always landing back at the playhead
+    const selectedOnTrack = track.notes.filter(n=>selectedNoteIds.has(n.id));
+    const pasteAt = selectedOnTrack.length
+      ? Math.max(...selectedOnTrack.map(n=>n.step+n.dur))
+      : Math.round(currentPlayStep());
     const newIds = [];
     state.clipboard.forEach(n=>{
       const id = nextNoteId++;
@@ -1702,14 +2032,17 @@ document.addEventListener("keydown", (e)=>{
       newIds.push(id);
     });
     selectedNoteIds = new Set(newIds);
-    renderNotes(); buildOverview(); recomputeStepsTotal();
+    renderNotes(); buildTrackList(); recomputeStepsTotal();
     toast("Pasted "+newIds.length+" note(s) at step "+pasteAt);
     e.preventDefault();
   } else if(e.key==="Delete" || e.key==="Backspace"){
     if(selectedNoteIds.size){
       pushHistory();
       track.notes = track.notes.filter(n=>!selectedNoteIds.has(n.id));
-      selectedNoteIds.clear(); renderNotes(); buildOverview();
+      selectedNoteIds.clear(); renderNotes(); buildTrackList();
+      e.preventDefault();
+    } else if(editContext==="track" && state.selectedTrackId!=null){
+      deleteSelectedTrack();
       e.preventDefault();
     }
   } else if(e.key==="ArrowUp" && selectedNoteIds.size){
@@ -1725,7 +2058,7 @@ document.addEventListener("keydown", (e)=>{
       }
     });
     if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
-    renderNotes(); e.preventDefault();
+    renderNotes(); scrollSelectionIntoView(); e.preventDefault();
   } else if(e.key==="ArrowDown" && selectedNoteIds.size){
     pushHistory();
     let previewPitch = null;
@@ -1739,7 +2072,7 @@ document.addEventListener("keydown", (e)=>{
       }
     });
     if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
-    renderNotes(); e.preventDefault();
+    renderNotes(); scrollSelectionIntoView(); e.preventDefault();
   } else if(e.key==="ArrowLeft" && selectedNoteIds.size){
     pushHistory();
     let previewPitch = null;
@@ -1752,7 +2085,7 @@ document.addEventListener("keydown", (e)=>{
       }
     });
     if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
-    renderNotes(); buildOverview(); e.preventDefault();
+    renderNotes(); buildTrackList(); scrollSelectionIntoView(); e.preventDefault();
   } else if(e.key==="ArrowRight" && selectedNoteIds.size){
     pushHistory();
     let previewPitch = null;
@@ -1765,7 +2098,18 @@ document.addEventListener("keydown", (e)=>{
       }
     });
     if(previewPitch!=null && !state.playing) previewNote(track, previewPitch);
-    renderNotes(); buildOverview(); recomputeStepsTotal(); e.preventDefault();
+    renderNotes(); buildTrackList(); recomputeStepsTotal(); scrollSelectionIntoView(); e.preventDefault();
+  } else if(phantomSelection && !selectedNoteIds.size && (e.key==="ArrowUp"||e.key==="ArrowDown"||e.key==="ArrowLeft"||e.key==="ArrowRight")){
+    // phantom (empty-cell) navigation: moves the highlighted cell only, never touches track.notes —
+    // no pushHistory(), since nothing about the project actually changes
+    if(e.key==="ArrowUp") phantomSelection.row = Math.max(0, phantomSelection.row-1);
+    else if(e.key==="ArrowDown") phantomSelection.row = Math.min(TOTAL_ROWS-1, phantomSelection.row+1);
+    // still one step per press — only the rendered span follows the Note Length
+    else if(e.key==="ArrowLeft") phantomSelection.step = clampPhantomStep(phantomSelection.step-1);
+    else if(e.key==="ArrowRight") phantomSelection.step = clampPhantomStep(phantomSelection.step+1);
+    renderNotes();
+    scrollSelectionIntoView();
+    e.preventDefault();
   } else if(e.code==="Space"){
     e.preventDefault();
     togglePlayPause();
@@ -1806,11 +2150,11 @@ document.getElementById("gridRuler").addEventListener("mousedown",(e)=>{
 /* ======================================================================
    LOOP REGION INTERACTION
    ====================================================================== */
-// the loop bar/region/handles now live in the arrange timeline and get rebuilt on every buildOverview() call,
-// so listeners are delegated to the stable #timelineInner node rather than bound to the (transient) elements themselves
-document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
+// the loop bar/region/handles now live in the track list and get rebuilt on every buildTrackList() call,
+// so listeners are delegated to the stable #trackListInner node rather than bound to the (transient) elements themselves
+document.getElementById("trackListInner").addEventListener("mousedown",(e)=>{
   if(!e.target.closest("#loopBar")) return;
-  const rect = document.getElementById("timelineInner").getBoundingClientRect();
+  const rect = document.getElementById("trackListInner").getBoundingClientRect();
   const spb = stepsPerBar();
   const x = e.clientX-rect.left;
 
@@ -1821,7 +2165,7 @@ document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
   const phX = currentPlayStep()/spb*BAR_PX;
   if(Math.abs(x-phX)<=8){
     if(state.playing) stopPlayback(false);
-    playheadDrag = {type:"overview"};
+    playheadDrag = {type:"trackList"};
     e.preventDefault(); e.stopPropagation();
     return;
   }
@@ -1843,11 +2187,16 @@ document.getElementById("timelineInner").addEventListener("mousedown",(e)=>{
     loopDrag = {mode:"move", downStep:x/BAR_PX*spb, startStart:state.loop.start, startEnd:state.loop.end};
     e.preventDefault(); e.stopPropagation(); return;
   }
-  // clicking the ruler background (not a handle, not inside the existing region) no longer spins up
-  // a brand new loop — that made it impossible to grab the playhead flag if the click landed a few
-  // pixels off target, since it fell through to here and started drawing a loop instead. Loop editing
-  // now stays confined to the handles and the region body; leave the event alone so it can keep
-  // bubbling up to the playhead-flag-grab check on #timelineCol.
+  // Clicking the bar's empty background (not a handle, not inside the existing region) moves the
+  // playhead there in ONE click and starts a drag, exactly like #trackListRuler and #gridRuler do.
+  // It deliberately does NOT spin up a brand new loop region the way it once did — that made the
+  // playhead flag nearly impossible to grab, since a click a few pixels off target started drawing
+  // a loop instead. Loop editing stays confined to the handles and the region body (handled above).
+  if(state.playing) stopPlayback(false);
+  state.playStartStep = Math.max(0, Math.min(STEPS_TOTAL, x/BAR_PX*spb));
+  playheadDrag = {type:"trackList"};
+  renderPlayheads();
+  e.preventDefault(); e.stopPropagation();
 });
 document.getElementById("loopBtn").addEventListener("click",()=>{
   state.loop.enabled = !state.loop.enabled;
@@ -1880,41 +2229,270 @@ document.getElementById("undoBtn").addEventListener("click", undo);
 document.getElementById("redoBtn").addEventListener("click", redo);
 
 /* ======================================================================
-   TRACK LIST EVENTS (event delegation)
+   INSTRUMENT LIST EVENTS (event delegation)
    ====================================================================== */
-document.getElementById("trackList").addEventListener("click",(e)=>{
-  const row = e.target.closest(".trackRow"); if(!row) return;
+document.getElementById("instrumentList").addEventListener("click",(e)=>{
+  const row = e.target.closest(".instrumentRow"); if(!row) return;
   const id = Number(row.dataset.id);
   const role = e.target.dataset.role;
   const track = state.tracks.find(t=>t.id===id);
-  if(role==="mute"){ pushHistory(); track.muted=!track.muted; refreshAllTrackGains(); renderTrackList(); return; }
-  if(role==="solo"){ pushHistory(); track.solo=!track.solo; refreshAllTrackGains(); renderTrackList(); return; }
+  if(e.target.classList.contains("swatch")){ openColorPicker(track, e.target); e.stopPropagation(); return; }
+  if(role==="mute"){ pushHistory(); track.muted=!track.muted; refreshAllTrackGains(); renderInstrumentList(); return; }
+  if(role==="solo"){ pushHistory(); track.solo=!track.solo; refreshAllTrackGains(); renderInstrumentList(); return; }
+  // The name is a plain <span data-role=nameText> until it's double-clicked. The second click of that
+  // double-click is detected here (e.detail===2) rather than via a "dblclick" listener: the first
+  // click selects the track, which rebuilds the whole list, and the browser only fires "dblclick"
+  // when both clicks land on the *same* node — the original span is gone by then. A single click
+  // behaves like clicking anywhere else on the row: it selects the track.
+  if(role==="nameText"){
+    if(e.detail>=2){ beginNameEdit(e.target); e.preventDefault(); return; }
+    selectTrack(id);
+    return;
+  }
   if(!role) selectTrack(id);
 });
-document.getElementById("trackList").addEventListener("mousedown",(e)=>{
+document.getElementById("instrumentList").addEventListener("mousedown",(e)=>{
   if(e.target.dataset.role==="vol") beginHistoryGesture();
+  // restore full waveform names before the popup opens, so the list never reads "S" / blank
+  if(e.target.dataset.role==="wave") applyWaveTier(e.target, 0);
 });
-document.getElementById("trackList").addEventListener("focusin",(e)=>{
+document.getElementById("instrumentList").addEventListener("focusin",(e)=>{
+  if(e.target.dataset.role==="wave") applyWaveTier(e.target, 0);
+});
+document.getElementById("instrumentList").addEventListener("focusin",(e)=>{
   if(e.target.dataset.role==="name") beginHistoryGesture();
 });
-document.getElementById("trackList").addEventListener("focusout",(e)=>{
-  if(e.target.dataset.role==="name") endHistoryGesture();
+document.getElementById("instrumentList").addEventListener("focusout",(e)=>{
+  if(e.target.dataset.role==="name"){ endHistoryGesture(); endNameEdit(e.target); }
+  if(e.target.dataset.role==="wave") fitRowControls(e.target.closest(".instrumentRow"));
 });
-document.getElementById("trackList").addEventListener("input",(e)=>{
-  const row = e.target.closest(".trackRow"); if(!row) return;
+/* ---------- rename an instrument: double-click only ----------
+   The name renders as a plain <span class="nameText"> so a single click just selects the track (and
+   never lands the caret in a text field). Double-clicking it swaps in a real <input data-role=name>,
+   which the existing input/focusin/focusout handlers above already drive; Enter or blur swaps the
+   plain text back. The input carries its own visible border (see .instrumentRow .tname input) so the
+   editable boundary is obvious while editing and invisible when not. */
+function beginNameEdit(span){
+  const row = span.closest(".instrumentRow"); if(!row) return;
+  const track = state.tracks.find(t=>t.id===Number(row.dataset.id)); if(!track) return;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.dataset.role = "name";
+  input.value = track.name;
+  span.replaceWith(input);
+  sizeNameInput(input);
+  fitRowControls(row);
+  input.focus();
+  input.select();
+}
+function endNameEdit(input){
+  if(!input || !input.isConnected) return;
+  const row = input.closest(".instrumentRow");
+  const span = document.createElement("span");
+  span.className = "nameText";
+  span.dataset.role = "nameText";
+  span.title = "Double-click to rename";
+  span.textContent = input.value;
+  input.replaceWith(span);
+  sizeNameInput(span);
+  fitRowControls(row);
+}
+document.getElementById("instrumentList").addEventListener("dblclick",(e)=>{
+  // the double-click's own FIRST click already selected the track, which rebuilt the whole list —
+  // so the element the two clicks share (this event's target) may be an ancestor of the name rather
+  // than the name itself. Resolve what's actually under the cursor now instead of trusting e.target.
+  const under = document.elementFromPoint(e.clientX, e.clientY);
+  const span = (under && under.closest('[data-role=nameText]'))
+            || (e.target.closest && e.target.closest('[data-role=nameText]'));
+  if(!span) return;
+  beginNameEdit(span);
+  e.preventDefault(); e.stopPropagation();
+});
+document.getElementById("instrumentList").addEventListener("keydown",(e)=>{
+  if(e.target.dataset.role!=="name") return;
+  if(e.key==="Enter" || e.key==="Escape"){
+    const input = e.target;
+    input.blur();
+    // don't wait on focusout alone: exiting edit mode is the point of the keypress, and endNameEdit
+    // no-ops if the blur already swapped the input out
+    endNameEdit(input);
+    e.preventDefault(); e.stopPropagation();
+  }
+});
+document.getElementById("instrumentList").addEventListener("input",(e)=>{
+  const row = e.target.closest(".instrumentRow"); if(!row) return;
   const id = Number(row.dataset.id);
   const track = state.tracks.find(t=>t.id===id);
   const role = e.target.dataset.role;
-  if(role==="name"){ track.name = e.target.value; buildOverview(); if(track.id===state.selectedTrackId) document.getElementById("instTrackName").textContent=track.name; }
-  if(role==="vol"){ track.volume = e.target.value/100; refreshAllTrackGains(); if(track.id===state.selectedTrackId) refreshInstrumentEditor(); }
-  if(role==="wave"){ pushHistory(); track.instrument.wave = e.target.value; if(track.id===state.selectedTrackId) refreshInstrumentEditor(); }
+  if(role==="name"){
+    track.name = e.target.value; sizeNameInput(e.target); fitRowControls(row); buildTrackList();
+    if(track.id===state.selectedTrackId) document.getElementById("instTrackName").textContent=track.name;
+  }
+  if(role==="vol"){ track.volume = e.target.value/100; refreshAllTrackGains(); if(track.id===state.selectedTrackId) refreshInstrumentEditor(); if(track.id===state.advancedTrackId) renderAdvancedEditor(); }
+  if(role==="wave"){ pushHistory(); track.instrument.wave = e.target.value; fitRowControls(row); if(track.id===state.selectedTrackId) refreshInstrumentEditor(); }
 });
-document.getElementById("timelineInner").addEventListener("click",(e)=>{
-  if(suppressTimelineClick){ suppressTimelineClick=false; return; }
-  const row = e.target.closest(".timelineRow"); if(!row) return;
+
+/* ======================================================================
+   TRACK COLOR PICKER (palette dropdown + bespoke hue/saturation custom picker)
+   ====================================================================== */
+function hsvToRgb(h,s,v){
+  h = ((h%360)+360)%360;
+  const c = v*s, x = c*(1-Math.abs((h/60)%2-1)), m = v-c;
+  let r,g,b;
+  if(h<60){ r=c;g=x;b=0; } else if(h<120){ r=x;g=c;b=0; } else if(h<180){ r=0;g=c;b=x; }
+  else if(h<240){ r=0;g=x;b=c; } else if(h<300){ r=x;g=0;b=c; } else { r=c;g=0;b=x; }
+  return [Math.round((r+m)*255), Math.round((g+m)*255), Math.round((b+m)*255)];
+}
+function rgbToHex(r,g,b){ return "#"+[r,g,b].map(v=>v.toString(16).padStart(2,"0")).join(""); }
+function hexToRgb(hex){
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return m ? [parseInt(m[1],16),parseInt(m[2],16),parseInt(m[3],16)] : [255,255,255];
+}
+function rgbToHsv(r,g,b){
+  r/=255; g/=255; b/=255;
+  const max=Math.max(r,g,b), min=Math.min(r,g,b), d=max-min;
+  let h=0;
+  if(d!==0){
+    if(max===r) h=60*(((g-b)/d)%6);
+    else if(max===g) h=60*((b-r)/d+2);
+    else h=60*((r-g)/d+4);
+  }
+  if(h<0) h+=360;
+  const s = max===0?0:d/max, v = max;
+  return [h,s,v];
+}
+
+let colorPickerTrack = null;
+let colorCustomHsv = [140,0.6,0.8];
+function closeColorPicker(){
+  colorPickerTrack = null;
+  document.getElementById("colorPicker").classList.add("hidden");
+  document.getElementById("colorCustomPanel").classList.add("hidden");
+}
+function openColorPicker(track, anchorEl){
+  colorPickerTrack = track;
+  const picker = document.getElementById("colorPicker");
+  const palette = document.getElementById("colorPalette");
+  palette.innerHTML = "";
+  TRACK_COLORS.forEach(color=>{
+    const b = document.createElement("button");
+    b.className = "colorSwatchBtn"; b.style.background = color; b.title = color;
+    b.addEventListener("click",()=>{
+      if(!colorPickerTrack) return;
+      pushHistory();
+      colorPickerTrack.color = color;
+      renderInstrumentList(); buildTrackList();
+      if(colorPickerTrack.id===state.advancedTrackId) renderAdvancedEditor();
+      closeColorPicker();
+    });
+    palette.appendChild(b);
+  });
+  document.getElementById("colorCustomPanel").classList.add("hidden");
+  colorCustomHsv = rgbToHsv(...hexToRgb(track.color));
+  drawColorHueCanvas();
+  drawColorSVCanvas();
+  positionColorDots();
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.left = Math.round(rect.left)+"px";
+  picker.style.top = Math.round(rect.bottom+6)+"px";
+  picker.classList.remove("hidden");
+}
+function drawColorHueCanvas(){
+  const canvas = document.getElementById("colorHueCanvas");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  const grad = ctx.createLinearGradient(0,0,w,0);
+  for(let i=0;i<=6;i++) grad.addColorStop(i/6, rgbToHex(...hsvToRgb(i*60,1,1)));
+  ctx.fillStyle = grad; ctx.fillRect(0,0,w,h);
+}
+function drawColorSVCanvas(){
+  const canvas = document.getElementById("colorSVCanvas");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  const hueColor = rgbToHex(...hsvToRgb(colorCustomHsv[0],1,1));
+  ctx.fillStyle = hueColor; ctx.fillRect(0,0,w,h);
+  const whiteGrad = ctx.createLinearGradient(0,0,w,0);
+  whiteGrad.addColorStop(0,"rgba(255,255,255,1)"); whiteGrad.addColorStop(1,"rgba(255,255,255,0)");
+  ctx.fillStyle = whiteGrad; ctx.fillRect(0,0,w,h);
+  const blackGrad = ctx.createLinearGradient(0,0,0,h);
+  blackGrad.addColorStop(0,"rgba(0,0,0,0)"); blackGrad.addColorStop(1,"rgba(0,0,0,1)");
+  ctx.fillStyle = blackGrad; ctx.fillRect(0,0,w,h);
+}
+function positionColorDots(){
+  const [h,s,v] = colorCustomHsv;
+  const svCanvas = document.getElementById("colorSVCanvas");
+  document.getElementById("colorSVDot").style.left = (s*svCanvas.clientWidth)+"px";
+  document.getElementById("colorSVDot").style.top = ((1-v)*svCanvas.clientHeight)+"px";
+  const hueCanvas = document.getElementById("colorHueCanvas");
+  document.getElementById("colorHueDot").style.left = ((h/360)*hueCanvas.clientWidth)+"px";
+}
+function applyCustomColor(commit){
+  if(!colorPickerTrack) return;
+  const [r,g,b] = hsvToRgb(...colorCustomHsv);
+  const hex = rgbToHex(r,g,b);
+  colorPickerTrack.color = hex;
+  renderInstrumentList(); buildTrackList();
+  if(colorPickerTrack.id===state.advancedTrackId) renderAdvancedEditor();
+}
+document.getElementById("colorCustomBtn").addEventListener("click",()=>{
+  document.getElementById("colorCustomPanel").classList.toggle("hidden");
+  drawColorHueCanvas(); drawColorSVCanvas(); positionColorDots();
+});
+let colorDrag = null; // {type:'sv'|'hue'}
+document.getElementById("colorSVWrap").addEventListener("mousedown",(e)=>{
+  if(!colorPickerTrack) return;
+  beginHistoryGesture();
+  colorDrag = {type:"sv"};
+  updateColorFromEvent(e);
+  e.preventDefault();
+});
+document.getElementById("colorHueWrap").addEventListener("mousedown",(e)=>{
+  if(!colorPickerTrack) return;
+  beginHistoryGesture();
+  colorDrag = {type:"hue"};
+  updateColorFromEvent(e);
+  e.preventDefault();
+});
+function updateColorFromEvent(e){
+  if(!colorDrag || !colorPickerTrack) return;
+  if(colorDrag.type==="sv"){
+    const rect = document.getElementById("colorSVCanvas").getBoundingClientRect();
+    const s = Math.max(0, Math.min(1, (e.clientX-rect.left)/rect.width));
+    const v = 1 - Math.max(0, Math.min(1, (e.clientY-rect.top)/rect.height));
+    colorCustomHsv[1] = s; colorCustomHsv[2] = v;
+  } else {
+    const rect = document.getElementById("colorHueCanvas").getBoundingClientRect();
+    const h = Math.max(0, Math.min(360, (e.clientX-rect.left)/rect.width*360));
+    colorCustomHsv[0] = h;
+    drawColorSVCanvas();
+  }
+  positionColorDots();
+  applyCustomColor();
+}
+window.addEventListener("mousemove",(e)=>{ if(colorDrag) updateColorFromEvent(e); });
+window.addEventListener("mouseup",()=>{ colorDrag = null; });
+document.addEventListener("mousedown",(e)=>{
+  const picker = document.getElementById("colorPicker");
+  if(picker.classList.contains("hidden")) return;
+  if(e.target.closest("#colorPicker") || e.target.classList.contains("swatch")) return;
+  closeColorPicker();
+});
+
+document.getElementById("trackListInner").addEventListener("click",(e)=>{
+  if(suppressTrackListClick){ suppressTrackListClick=false; return; }
+  const row = e.target.closest(".trackRow"); if(!row) return;
   selectTrack(Number(row.dataset.id), {scrollToFirstNote:true});
 });
-document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
+document.getElementById("trackListCol").addEventListener("mousedown",(e)=>{
+  if(e.target.closest("#trackListRuler")){
+    if(state.playing) stopPlayback(false);
+    const rect = document.getElementById("trackListInner").getBoundingClientRect();
+    state.playStartStep = Math.max(0, Math.min(STEPS_TOTAL, (e.clientX-rect.left)/BAR_PX*stepsPerBar()));
+    playheadDrag = {type:"trackList"};
+    renderPlayheads();
+    e.preventDefault(); e.stopPropagation();
+    return;
+  }
   const handleEl = e.target.closest(".blockHandle");
   if(handleEl){
     const trackId = Number(handleEl.dataset.trackId);
@@ -1941,13 +2519,13 @@ document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
       minBound: prevRegion ? prevRegion.end : 0,
       maxBound: nextRegion ? nextRegion.start : STEPS_TOTAL
     };
-    buildOverview();
+    buildTrackList();
     e.preventDefault(); e.stopPropagation();
     return;
   }
-  const blockEl = e.target.closest(".overviewBlock");
+  const blockEl = e.target.closest(".trackBlock");
   if(blockEl){
-    const rowEl = e.target.closest(".timelineRow");
+    const rowEl = e.target.closest(".trackRow");
     const trackId = Number(rowEl.dataset.id);
     const track = state.tracks.find(t=>t.id===trackId);
     if(!track) return;
@@ -1957,13 +2535,13 @@ document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
       // shift-click toggles this region into/out of the multi-selection, without starting a drag
       if(selectedRegionIds.has(regionId)) selectedRegionIds.delete(regionId);
       else selectedRegionIds.add(regionId);
-      buildOverview();
+      buildTrackList();
       e.preventDefault(); e.stopPropagation();
       return;
     }
     selectedRegionIds = regionId!=null ? new Set([regionId]) : new Set();
 
-    // clicking directly on a block rebuilds the timeline DOM synchronously (via selectTrack -> buildOverview),
+    // clicking directly on a block rebuilds the track-list DOM synchronously (via selectTrack -> buildTrackList),
     // which means the native "click" event never fires afterward — so the scroll-to-first-note has to happen here
     selectTrack(trackId, {scrollToFirstNote:true});
     pushHistory();
@@ -1991,37 +2569,37 @@ document.getElementById("timelineCol").addEventListener("mousedown",(e)=>{
     e.preventDefault(); e.stopPropagation();
     return;
   }
-  if(selectedRegionIds.size){ selectedRegionIds.clear(); buildOverview(); }
-  const rect = document.getElementById("timelineInner").getBoundingClientRect();
+  if(selectedRegionIds.size){ selectedRegionIds.clear(); buildTrackList(); }
+  const rect = document.getElementById("trackListInner").getBoundingClientRect();
   const x = e.clientX-rect.left;
   const phX = currentPlayStep()/stepsPerBar()*BAR_PX;
   if(Math.abs(x-phX)<=8){
     if(state.playing) stopPlayback(false);
-    playheadDrag = {type:"overview"};
+    playheadDrag = {type:"trackList"};
     e.preventDefault(); e.stopPropagation();
   }
 });
 
-// keep the track list and the arrange timeline scrolling together vertically
+// keep the instrument list and the track list scrolling together vertically
+const instrumentListScrollEl = document.getElementById("instrumentListScroll");
 const trackListCol = document.getElementById("trackListCol");
-const timelineCol = document.getElementById("timelineCol");
 let syncingArrangeScroll = false;
+instrumentListScrollEl.addEventListener("scroll", ()=>{
+  if(syncingArrangeScroll) return;
+  syncingArrangeScroll = true;
+  trackListCol.scrollTop = instrumentListScrollEl.scrollTop;
+  syncingArrangeScroll = false;
+  positionTrackListFlag();
+});
 trackListCol.addEventListener("scroll", ()=>{
   if(syncingArrangeScroll) return;
   syncingArrangeScroll = true;
-  timelineCol.scrollTop = trackListCol.scrollTop;
+  instrumentListScrollEl.scrollTop = trackListCol.scrollTop;
   syncingArrangeScroll = false;
-  positionOverviewFlag();
+  positionTrackListFlag();
 });
-timelineCol.addEventListener("scroll", ()=>{
-  if(syncingArrangeScroll) return;
-  syncingArrangeScroll = true;
-  trackListCol.scrollTop = timelineCol.scrollTop;
-  syncingArrangeScroll = false;
-  positionOverviewFlag();
-});
-document.getElementById("timelineCol").addEventListener("dblclick",(e)=>{
-  const rect = document.getElementById("timelineInner").getBoundingClientRect();
+document.getElementById("trackListCol").addEventListener("dblclick",(e)=>{
+  const rect = document.getElementById("trackListInner").getBoundingClientRect();
   const x = e.clientX-rect.left;
   const step = Math.round(x/BAR_PX*stepsPerBar());
   state.playStartStep = Math.max(0,step); renderPlayheads();
@@ -2029,7 +2607,9 @@ document.getElementById("timelineCol").addEventListener("dblclick",(e)=>{
   gridScroll.scrollLeft = step*STEP_W-100;
 });
 
-document.getElementById("addTrackBtn").addEventListener("click", addTrack);
+document.getElementById("instrumentRowHeightSlider").addEventListener("input",(e)=> setTrackRowHeight(Number(e.target.value)));
+document.getElementById("trackZoomSlider").addEventListener("input",(e)=> setTrackZoom(Number(e.target.value)));
+
 document.getElementById("addTrackBtnTop").addEventListener("click", addTrack);
 document.getElementById("deleteTrackBtn").addEventListener("click", deleteSelectedTrack);
 document.getElementById("splitBtn").addEventListener("click", ()=>{
@@ -2054,7 +2634,7 @@ document.getElementById("splitBtn").addEventListener("click", ()=>{
   const left = {id: nextNoteId++, start:region.start, end:splitStep};
   const right = {id: nextNoteId++, start:splitStep, end:region.end};
   track.regions.splice(idx, 1, left, right);
-  renderTrackList(); buildOverview(); renderNotes();
+  renderInstrumentList(); buildTrackList(); renderNotes();
   toast("Split \""+track.name+"\" at step "+splitStep);
 });
 
@@ -2067,9 +2647,9 @@ function bindSlider(id, cb){
   el.addEventListener("input",(e)=>{ cb(Number(e.target.value)); });
 }
 document.getElementById("waveSel").addEventListener("change",(e)=>{
-  const t=selectedTrack(); if(!t) return; pushHistory(); t.instrument.wave=e.target.value; renderTrackList();
+  const t=selectedTrack(); if(!t) return; pushHistory(); t.instrument.wave=e.target.value; renderInstrumentList();
 });
-bindSlider("volSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.volume=v/100; document.getElementById("volVal").textContent=v; refreshAllTrackGains(); renderTrackList(); renderAdvancedEditor(); });
+bindSlider("volSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.volume=v/100; document.getElementById("volVal").textContent=v; refreshAllTrackGains(); renderInstrumentList(); renderAdvancedEditor(); });
 bindSlider("atkSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.attack=v; document.getElementById("atkVal").textContent=v+"ms"; });
 bindSlider("relSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.release=v; document.getElementById("relVal").textContent=v+"ms"; });
 bindSlider("eqLowSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.eqLow=v; document.getElementById("eqLowVal").textContent=v+"dB"; applyInstrumentToChain(t); renderAdvancedEditor(); });
@@ -2102,7 +2682,7 @@ document.getElementById("sampleInput").addEventListener("change",(e)=>{
       track.instrument.wave = "custom";
       document.getElementById("waveSel").value="custom";
       document.getElementById("sampleName").textContent = file.name;
-      renderTrackList();
+      renderInstrumentList();
       toast("Loaded sample: "+file.name);
     }, (err)=>{ toast("Could not decode audio file"); });
   };
@@ -2115,9 +2695,18 @@ document.getElementById("sampleInput").addEventListener("change",(e)=>{
    ====================================================================== */
 document.getElementById("bpmInput").addEventListener("change",(e)=>{ state.bpm = Math.max(30,Math.min(300,Number(e.target.value)||120)); });
 document.getElementById("timeSigSel").addEventListener("change",(e)=>{
-  const [a,b] = e.target.value.split("/").map(Number); state.timeSig=[a,b]; drawGridLines(); drawGridRuler(); buildOverview();
+  const [a,b] = e.target.value.split("/").map(Number); state.timeSig=[a,b]; drawGridLines(); drawGridRuler(); buildTrackList();
 });
-document.getElementById("noteLenSel").addEventListener("change",(e)=>{ state.noteLenSteps = Number(e.target.value); });
+document.getElementById("noteLenSel").addEventListener("change",(e)=>{
+  state.noteLenSteps = Number(e.target.value);
+  // the ghost cell spans the note length, so a live change resizes it (and may push its right edge
+  // past the grid end or out of view) — re-clamp, redraw and re-check scroll
+  if(phantomSelection){
+    phantomSelection.step = clampPhantomStep(phantomSelection.step);
+    renderNotes();
+    scrollSelectionIntoView();
+  }
+});
 document.getElementById("keySel").addEventListener("change",(e)=>{ state.key=e.target.value; buildPianoLabels(); drawGridLines(); });
 document.getElementById("modeSel").addEventListener("change",(e)=>{ state.mode=e.target.value; buildPianoLabels(); drawGridLines(); });
 document.getElementById("octaveSel").addEventListener("change",(e)=>{
@@ -2125,6 +2714,43 @@ document.getElementById("octaveSel").addEventListener("change",(e)=>{
   const midi=(state.octaveFocus+1)*12;
   gridScroll.scrollTop = midiToRow(midi)*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2;
   syncPianoScroll();
+});
+
+/* ---------- project title (sub-header): plain text, editable on double-click ----------
+   Mirrors how instrument names behave in the instrument list: no border while displaying, a bordered
+   input while editing, committed on Enter/blur. state.projectTitle is what serializeProject() writes
+   and what the Save dialog prefills its own (still editable) title field from. */
+function renderProjectTitle(){
+  const span = document.getElementById("projectTitle");
+  if(span) span.textContent = state.projectTitle || "Bit Beats Project";
+}
+function beginProjectTitleEdit(){
+  const wrap = document.getElementById("projectTitleWrap");
+  const span = document.getElementById("projectTitle");
+  if(!wrap || !span) return;
+  const input = document.createElement("input");
+  input.type = "text"; input.maxLength = 80; input.id = "projectTitleInput";
+  input.value = state.projectTitle || "";
+  const commit = ()=>{
+    if(!input.isConnected) return;
+    state.projectTitle = input.value.trim() || "Bit Beats Project";
+    input.replaceWith(span);
+    renderProjectTitle();
+  };
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown",(e)=>{
+    if(e.key==="Enter"){ commit(); e.preventDefault(); }
+    else if(e.key==="Escape"){ input.value = state.projectTitle || ""; commit(); e.preventDefault(); }
+    e.stopPropagation();
+  });
+  span.replaceWith(input);
+  input.focus(); input.select();
+}
+document.getElementById("projectTitleWrap").addEventListener("click",(e)=>{
+  if(e.detail>=2 && e.target.id==="projectTitle") beginProjectTitleEdit();
+});
+document.getElementById("projectTitleWrap").addEventListener("dblclick",(e)=>{
+  if(e.target.id==="projectTitle") beginProjectTitleEdit();
 });
 
 document.getElementById("playBtn").addEventListener("click", togglePlayPause);
@@ -2144,7 +2770,7 @@ gridScroll.addEventListener("scroll", syncPianoScroll);
    ====================================================================== */
 function serializeProject(){
   return {
-    bpm: state.bpm, timeSig: state.timeSig, key: state.key, mode: state.mode,
+    projectTitle: state.projectTitle, bpm: state.bpm, timeSig: state.timeSig, key: state.key, mode: state.mode,
     octaveFocus: state.octaveFocus, noteLenSteps: state.noteLenSteps,
     tracks: state.tracks.map(t=>({
       id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan,
@@ -2157,29 +2783,421 @@ function serializeProject(){
     }))
   };
 }
-document.getElementById("saveBtn").addEventListener("click", ()=>{
-  const data = JSON.stringify(serializeProject(), null, 1);
-  const blob = new Blob([data], {type:"application/json"});
+/* ---- export: WAV (offline render of the whole project) ---- */
+function audioBufferToWavBlob(buffer){
+  const numCh = buffer.numberOfChannels, sr = buffer.sampleRate, len = buffer.length;
+  const blockAlign = numCh*2, dataSize = len*blockAlign;
+  const ab = new ArrayBuffer(44+dataSize);
+  const view = new DataView(ab);
+  const writeStr = (offset,str)=>{ for(let i=0;i<str.length;i++) view.setUint8(offset+i, str.charCodeAt(i)); };
+  writeStr(0,"RIFF"); view.setUint32(4,36+dataSize,true); writeStr(8,"WAVE");
+  writeStr(12,"fmt "); view.setUint32(16,16,true); view.setUint16(20,1,true);
+  view.setUint16(22,numCh,true); view.setUint32(24,sr,true);
+  view.setUint32(28,sr*blockAlign,true); view.setUint16(32,blockAlign,true); view.setUint16(34,16,true);
+  writeStr(36,"data"); view.setUint32(40,dataSize,true);
+  const channels = []; for(let c=0;c<numCh;c++) channels.push(buffer.getChannelData(c));
+  let offset = 44;
+  for(let i=0;i<len;i++){
+    for(let c=0;c<numCh;c++){
+      const s = Math.max(-1, Math.min(1, channels[c][i]));
+      view.setInt16(offset, s<0 ? s*0x8000 : s*0x7FFF, true);
+      offset += 2;
+    }
+  }
+  return new Blob([ab], {type:"audio/wav"});
+}
+// renders the whole project offline into a raw AudioBuffer — shared by both the WAV and MP3 export
+// paths, which just encode this same buffer two different ways
+// `loopCount` (default 1) renders the project back-to-back that many times. It is deliberately done
+// by scheduling every note again on each pass inside ONE offline render — rather than rendering once
+// and concatenating the resulting buffer — so a note's release and its reverb tail bleed across each
+// seam exactly as they would in live playback. Concatenating a buffer that already contains a tail
+// would duplicate that tail and leave an audible bump at every repeat.
+// The repeat period is the project length rounded UP to a whole bar, so each pass starts on the beat.
+async function renderProjectToAudioBuffer(loopCount){
+  const repeats = Math.max(1, Math.floor(Number(loopCount)||1));
+  let lastStep = stepsPerBar();
+  state.tracks.forEach(t=> t.notes.forEach(n=> lastStep = Math.max(lastStep, n.step+n.dur)));
+  const spb = stepsPerBar();
+  const loopLenSteps = Math.max(spb, Math.ceil(lastStep/spb)*spb);
+  const loopSec = loopLenSteps*stepDurSec();
+  const tailSec = 1.0; // let releases/reverb ring out past the last note
+  const durSec = repeats*loopSec + tailSec;
+  const sr = actx.sampleRate;
+  const offlineCtx = new OfflineAudioContext(2, Math.ceil(durSec*sr), sr);
+  const offlineMaster = offlineCtx.createGain(); offlineMaster.gain.value = masterGain.gain.value;
+  offlineMaster.connect(offlineCtx.destination);
+  // reverb/noise buffers must belong to offlineCtx — buffers created against the live actx can't be
+  // reused in an OfflineAudioContext's graph, so these are regenerated the same way makeReverbBuffer/
+  // getNoiseBuffer do it for the live context
+  const reverbBuf = (()=>{
+    const rate = offlineCtx.sampleRate, rlen = rate*2.2, buf = offlineCtx.createBuffer(2,rlen,rate);
+    for(let ch=0; ch<2; ch++){ const d = buf.getChannelData(ch);
+      for(let i=0;i<rlen;i++){ d[i] = (Math.random()*2-1) * Math.pow(1-i/rlen, 2.5); } }
+    return buf;
+  })();
+  const noiseBuf = (()=>{
+    const len = offlineCtx.sampleRate, buf = offlineCtx.createBuffer(1,len,offlineCtx.sampleRate);
+    const d = buf.getChannelData(0); for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+    return buf;
+  })();
+  const solo = anySolo();
+  state.tracks.forEach(track=>{
+    const chain = makeChain(offlineCtx, reverbBuf, offlineMaster);
+    const audible = solo ? track.solo : !track.muted;
+    const hasAutomation = Object.values(track.automation).some(arr=>arr && arr.length);
+    if(!hasAutomation){
+      chain.eqLow.gain.value = track.instrument.eqLow;
+      chain.eqMid.gain.value = track.instrument.eqMid;
+      chain.eqHigh.gain.value = track.instrument.eqHigh;
+      const wetAmt = track.instrument.reverb/100;
+      chain.dry.gain.value = 1-wetAmt*0.6; chain.wet.gain.value = wetAmt;
+      chain.trackOut.gain.value = audible ? track.volume : 0;
+      chain.panNode.pan.value = (track.pan-50)/50;
+    } else {
+      // automation moves parameters over time, so sample the drawn curves at a fixed rate across the
+      // whole render and schedule them, mirroring what applyAutomationAtStep does tick-by-tick live
+      const dt = 0.1;
+      for(let t=0; t<=durSec; t+=dt){
+        // automation replays from the top on every repeat, same as the notes do
+        const step = (t % loopSec)/stepDurSec();
+        const vol = automationValueAt(track,"volume",step)/100;
+        const pan = Math.max(-1, Math.min(1, (automationValueAt(track,"pan",step)-50)/50));
+        const reverb = automationValueAt(track,"reverb",step)/100;
+        chain.trackOut.gain.setValueAtTime(audible?vol:0, t);
+        chain.panNode.pan.setValueAtTime(pan, t);
+        chain.eqLow.gain.setValueAtTime(automationValueAt(track,"eqLow",step)/100*48-24, t);
+        chain.eqMid.gain.setValueAtTime(automationValueAt(track,"eqMid",step)/100*48-24, t);
+        chain.eqHigh.gain.setValueAtTime(automationValueAt(track,"eqHigh",step)/100*48-24, t);
+        chain.dry.gain.setValueAtTime(1-reverb*0.6, t);
+        chain.wet.gain.setValueAtTime(reverb, t);
+      }
+    }
+    if(!audible) return;
+    for(let pass=0; pass<repeats; pass++){
+      const passOffset = pass*loopSec;
+      track.notes.forEach(note=>{
+        const startTime = passOffset + note.step*stepDurSec();
+        playNote(track, note.pitch, startTime, note.dur*stepDurSec()*0.92, note.bendTo,
+          clampedBendStartStep(note)*stepDurSec(), clampedBendEndStep(note)*stepDurSec(),
+          {ctx: offlineCtx, chain, noiseBuffer: noiseBuf});
+      });
+    }
+  });
+  return offlineCtx.startRendering();
+}
+async function renderProjectToWavBlob(loopCount){
+  return audioBufferToWavBlob(await renderProjectToAudioBuffer(loopCount));
+}
+
+/* ---- export: MP3 (via bundled lamejs — see lamejs.min.js) ---- */
+function audioBufferToMp3Blob(buffer){
+  const numCh = Math.min(2, buffer.numberOfChannels);
+  const encoder = new lamejs.Mp3Encoder(numCh, buffer.sampleRate, 160);
+  const toInt16 = (channelData)=>{
+    const out = new Int16Array(channelData.length);
+    for(let i=0;i<channelData.length;i++){
+      const s = Math.max(-1, Math.min(1, channelData[i]));
+      out[i] = s<0 ? s*0x8000 : s*0x7FFF;
+    }
+    return out;
+  };
+  const left = toInt16(buffer.getChannelData(0));
+  const right = numCh>1 ? toInt16(buffer.getChannelData(1)) : null;
+  const blockSize = 1152; // lamejs encodes one MPEG frame's worth of samples per call
+  const chunks = [];
+  for(let i=0; i<left.length; i+=blockSize){
+    const chunk = numCh>1
+      ? encoder.encodeBuffer(left.subarray(i,i+blockSize), right.subarray(i,i+blockSize))
+      : encoder.encodeBuffer(left.subarray(i,i+blockSize));
+    if(chunk.length) chunks.push(chunk);
+  }
+  const finalChunk = encoder.flush();
+  if(finalChunk.length) chunks.push(finalChunk);
+  return new Blob(chunks, {type:"audio/mpeg"});
+}
+async function renderProjectToMp3Blob(loopCount){
+  return audioBufferToMp3Blob(await renderProjectToAudioBuffer(loopCount));
+}
+
+/* ---- export: Standard MIDI File (format 1) ---- */
+function midiVarLen(value){
+  const bytes = [value & 0x7F];
+  value = Math.floor(value/128);
+  while(value>0){ bytes.unshift((value & 0x7F) | 0x80); value = Math.floor(value/128); }
+  return bytes;
+}
+function midiTrackChunk(eventBytes){
+  const len = eventBytes.length;
+  return [0x4D,0x54,0x72,0x6B, (len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF, ...eventBytes];
+}
+// rough General MIDI program per waveform, just so a MIDI player picks *some* reasonable timbre
+function gmProgramForWave(wave){
+  return {square:80, pulse25:80, pulse12:80, sawtooth:81, triangle:73, sine:89, custom:0}[wave] ?? 0;
+}
+function projectToMidiBytes(){
+  const PPQ = 480, ticksPerStep = PPQ/4; // steps are always 16th notes
+  const ntracks = state.tracks.length+1;
+  const header = [0x4D,0x54,0x68,0x64, 0,0,0,6, 0,1, (ntracks>>8)&0xFF,ntracks&0xFF, (PPQ>>8)&0xFF, PPQ&0xFF];
+  const conductorEvents = [];
+  const usPerQuarter = Math.round(60000000/state.bpm);
+  conductorEvents.push(...midiVarLen(0), 0xFF,0x51,0x03, (usPerQuarter>>16)&0xFF,(usPerQuarter>>8)&0xFF,usPerQuarter&0xFF);
+  const denomPow2 = Math.round(Math.log2(state.timeSig[1]));
+  conductorEvents.push(...midiVarLen(0), 0xFF,0x58,0x04, state.timeSig[0], denomPow2, 24, 8);
+  conductorEvents.push(...midiVarLen(0), 0xFF,0x2F,0x00);
+  const chunks = [midiTrackChunk(conductorEvents)];
+  state.tracks.forEach((track,idx)=>{
+    const channel = track.instrument.wave==="noise" ? 9 : (idx%15 >= 9 ? idx%15+1 : idx%15); // dodge ch.10 (drums) for melodic tracks
+    const events = [];
+    const nameBytes = Array.from(track.name).map(c=>c.charCodeAt(0)).slice(0,40);
+    events.push(...midiVarLen(0), 0xFF,0x03, nameBytes.length, ...nameBytes);
+    events.push(...midiVarLen(0), 0xC0|channel, gmProgramForWave(track.instrument.wave));
+    const noteEvents = [];
+    track.notes.forEach(n=>{
+      const onTick = Math.round(n.step*ticksPerStep);
+      const offTick = Math.round((n.step+n.dur)*ticksPerStep);
+      const pitch = Math.max(0, Math.min(127, Math.round(n.pitch)));
+      noteEvents.push({tick:onTick, bytes:[0x90|channel, pitch, 100]});
+      noteEvents.push({tick:Math.max(onTick+1,offTick), bytes:[0x80|channel, pitch, 0]});
+    });
+    noteEvents.sort((a,b)=> a.tick-b.tick);
+    let prevTick = 0;
+    noteEvents.forEach(ev=>{
+      events.push(...midiVarLen(ev.tick-prevTick), ...ev.bytes);
+      prevTick = ev.tick;
+    });
+    events.push(...midiVarLen(0), 0xFF,0x2F,0x00);
+    chunks.push(midiTrackChunk(events));
+  });
+  const bytes = [].concat(header, ...chunks);
+  return new Uint8Array(bytes);
+}
+
+/* ---- import: Standard MIDI File (.mid/.midi) — the inverse of projectToMidiBytes above ---- */
+function midiReadVarLen(bytes, pos){
+  let value = 0, byte;
+  do{ byte = bytes[pos++]; value = (value<<7) | (byte & 0x7F); } while(byte & 0x80);
+  return {value, pos};
+}
+function parseMidiFile(arrayBuffer){
+  const bytes = new Uint8Array(arrayBuffer);
+  let pos = 0;
+  function readStr(len){ let s=""; for(let i=0;i<len;i++) s+=String.fromCharCode(bytes[pos++]); return s; }
+  function readU32(){ const v=(bytes[pos]<<24)|(bytes[pos+1]<<16)|(bytes[pos+2]<<8)|bytes[pos+3]; pos+=4; return v>>>0; }
+  function readU16(){ const v=(bytes[pos]<<8)|bytes[pos+1]; pos+=2; return v; }
+  if(readStr(4)!=="MThd") throw new Error("not a MIDI file");
+  const hdrLen = readU32();
+  readU16(); // format — not needed, format 0/1 both handled the same by just reading every MTrk chunk
+  const ntrks = readU16();
+  const division = readU16();
+  pos += Math.max(0, hdrLen-6); // header is normally exactly 6 bytes, but skip forward if a file pads it
+  if(division & 0x8000) throw new Error("SMPTE-based MIDI timing isn't supported");
+  const ticksPerStep = division/4; // steps are always 16th notes — same convention projectToMidiBytes uses
+
+  const tracks = [];
+  let tempoUsPerQuarter = 500000; // default 120bpm, overwritten if the file sets a tempo meta event
+  let timeSigNum = 4, timeSigDenPow = 2;
+
+  for(let t=0; t<ntrks && pos<bytes.length; t++){
+    if(readStr(4)!=="MTrk") break;
+    const chunkLen = readU32();
+    const chunkEnd = pos+chunkLen;
+    let tick = 0, runningStatus = 0, trackName = null;
+    const activeNotes = new Map(); // pitch -> tick note-on happened, so a later note-off can compute duration
+    const noteEvents = [];
+    while(pos<chunkEnd){
+      const dt = midiReadVarLen(bytes,pos); pos = dt.pos; tick += dt.value;
+      let statusByte = bytes[pos];
+      if(statusByte & 0x80){ runningStatus = statusByte; pos++; } else { statusByte = runningStatus; }
+      if(statusByte===0xFF){
+        const metaType = bytes[pos++];
+        const len = midiReadVarLen(bytes,pos); pos = len.pos;
+        if(metaType===0x03){ const name = readStr(len.value); if(trackName==null) trackName = name; }
+        else if(metaType===0x51 && len.value===3){ tempoUsPerQuarter = (bytes[pos]<<16)|(bytes[pos+1]<<8)|bytes[pos+2]; pos+=len.value; }
+        else if(metaType===0x58 && len.value>=2){ timeSigNum = bytes[pos]; timeSigDenPow = bytes[pos+1]; pos+=len.value; }
+        else pos += len.value;
+      } else if(statusByte===0xF0 || statusByte===0xF7){
+        const len = midiReadVarLen(bytes,pos); pos = len.pos; pos += len.value;
+      } else {
+        const type = statusByte & 0xF0;
+        if(type===0x90 || type===0x80){
+          const pitch = bytes[pos++], vel = bytes[pos++];
+          if(type===0x90 && vel>0){
+            activeNotes.set(pitch, tick);
+          } else {
+            const startTick = activeNotes.get(pitch);
+            if(startTick!=null){ activeNotes.delete(pitch); noteEvents.push({startTick, endTick:tick, pitch}); }
+          }
+        } else if(type===0xC0 || type===0xD0){ pos += 1; }
+        else { pos += 2; }
+      }
+    }
+    pos = chunkEnd;
+    if(noteEvents.length) tracks.push({name: trackName || ("Track "+(t+1)), noteEvents});
+  }
+  const bpm = Math.round(60000000/tempoUsPerQuarter);
+  return {ticksPerStep, tracks, bpm, timeSig:[timeSigNum, Math.pow(2,timeSigDenPow)]};
+}
+// imports parsed MIDI tracks by appending them to the current project (like addTrack/paste-track),
+// so it composes with undo history rather than replacing the project the way loadProject does
+function importMidiTracks(parsed){
+  if(!parsed.tracks.length){ toast("No note data found in that MIDI file"); return; }
+  pushHistory();
+  const startColorIdx = state.tracks.length;
+  let imported = 0;
+  parsed.tracks.forEach((mt, i)=>{
+    const t = makeTrack(mt.name, startColorIdx+i);
+    buildChain(t);
+    mt.noteEvents.forEach(ne=>{
+      const stepStart = Math.round(ne.startTick/parsed.ticksPerStep);
+      const stepEnd = ne.endTick/parsed.ticksPerStep;
+      const dur = Math.max(1, Math.round(stepEnd-stepStart));
+      // clamp into the app's representable pitch range (matches rowToMidi/TOP_MIDI/TOTAL_ROWS)
+      const pitch = Math.max(TOP_MIDI-TOTAL_ROWS+1, Math.min(TOP_MIDI, ne.pitch));
+      const note = {id: nextNoteId++, step:stepStart, pitch, dur, bendTo:null};
+      t.notes.push(note);
+      extendRegionsForNote(t, note);
+    });
+    if(t.notes.length){ state.tracks.push(t); imported++; }
+  });
+  if(!imported){ undoStack.pop(); toast("No note data found in that MIDI file"); return; }
+  if(parsed.bpm>=30 && parsed.bpm<=300){
+    state.bpm = parsed.bpm;
+    document.getElementById("bpmInput").value = state.bpm;
+  }
+  state.selectedTrackId = state.tracks[state.tracks.length-1].id;
+  renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList(); recomputeStepsTotal();
+  toast("Imported "+imported+" track"+(imported===1?"":"s")+" from MIDI");
+}
+
+/* ---- Save modal: title + filetype, native "save as" picker when available ---- */
+const exportTypeInfo = {
+  mp3: {ext:"mp3", mime:"audio/mpeg", desc:"Audio"},
+  wav: {ext:"wav", mime:"audio/wav", desc:"Audio"},
+  mid: {ext:"mid", mime:"audio/midi", desc:"MIDI"},
+  json:{ext:"json", mime:"application/json", desc:"Project"}
+};
+async function saveBlobToDisk(blob, suggestedName, mime){
+  if(window.showSaveFilePicker){
+    try{
+      const ext = suggestedName.slice(suggestedName.lastIndexOf("."));
+      const handle = await window.showSaveFilePicker({
+        suggestedName,
+        types:[{description:mime, accept:{[mime]:[ext]}}]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return true;
+    }catch(err){
+      if(err && err.name==="AbortError") return false; // user cancelled the picker — don't also fall back
+      // fall through to the download fallback for any other failure (e.g. API unsupported despite the feature check)
+    }
+  }
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob); a.download = "Bit Beats Project.json"; a.click();
-  toast("Project saved");
+  a.href = URL.createObjectURL(blob); a.download = suggestedName; a.click();
+  return true;
+}
+/* ---- small modal used to tell the user something before continuing (resolves when acknowledged) ---- */
+function showInfoDialog(title, body){
+  return new Promise(resolve=>{
+    const modal = document.getElementById("infoModal");
+    document.getElementById("infoTitle").textContent = title;
+    document.getElementById("infoBody").textContent = body;
+    modal.classList.remove("hidden");
+    const ok = document.getElementById("infoOkBtn");
+    const done = ()=>{ ok.removeEventListener("click", done); modal.classList.add("hidden"); resolve(); };
+    ok.addEventListener("click", done);
+    ok.focus();
+  });
+}
+// the loop count only means anything while looping is switched on
+function syncExportLoopUI(){
+  const on = document.getElementById("exportLoopChk").checked;
+  document.getElementById("exportLoopCount").disabled = !on;
+}
+document.getElementById("exportLoopChk").addEventListener("change", syncExportLoopUI);
+document.getElementById("saveBtn").addEventListener("click", ()=>{
+  // prefilled from the sub-header's project title, but still freely editable here
+  document.getElementById("exportTitleInput").value = state.projectTitle || "Bit Beats Project";
+  document.getElementById("exportStatus").textContent = "";
+  syncExportLoopUI();
+  document.getElementById("exportModal").classList.remove("hidden");
+  document.getElementById("exportTitleInput").focus();
+});
+document.getElementById("exportCancelBtn").addEventListener("click", ()=>{
+  document.getElementById("exportModal").classList.add("hidden");
+});
+document.getElementById("exportConfirmBtn").addEventListener("click", async ()=>{
+  const titleInput = document.getElementById("exportTitleInput");
+  const title = titleInput.value.trim() || "Bit Beats Project";
+  state.projectTitle = title;
+  renderProjectTitle();
+  const type = document.getElementById("exportTypeSel").value;
+  const info = exportTypeInfo[type];
+  const statusEl = document.getElementById("exportStatus");
+  const confirmBtn = document.getElementById("exportConfirmBtn");
+  const loopOn = document.getElementById("exportLoopChk").checked;
+  const loopCount = loopOn
+    ? Math.max(2, Math.min(64, Math.round(Number(document.getElementById("exportLoopCount").value)||2)))
+    : 1;
+  // MIDI and JSON describe the project itself, not a rendered performance, so there is nothing to
+  // repeat in the file — say so, then continue with a normal single-pass export once acknowledged
+  if(loopOn && (type==="mid" || type==="json")){
+    await showInfoDialog("Looping doesn't apply to ."+info.ext+" files",
+      "Repeats only affect rendered audio (MP3 / WAV). A ."+info.ext+" file stores the project itself, "+
+      "so it will be saved once through — you can still repeat it in whatever plays or opens it. "+
+      "Saving a single pass now.");
+  }
+  confirmBtn.disabled = true;
+  try{
+    let blob;
+    if(type==="json"){
+      blob = new Blob([JSON.stringify(serializeProject(), null, 1)], {type:info.mime});
+    } else if(type==="mid"){
+      statusEl.textContent = "Writing MIDI…";
+      blob = new Blob([projectToMidiBytes()], {type:info.mime});
+    } else if(type==="mp3"){
+      statusEl.textContent = loopCount>1 ? "Rendering audio ("+loopCount+" repeats)…" : "Rendering audio…";
+      blob = await renderProjectToMp3Blob(loopCount);
+    } else {
+      statusEl.textContent = loopCount>1 ? "Rendering audio ("+loopCount+" repeats)…" : "Rendering audio…";
+      blob = await renderProjectToWavBlob(loopCount);
+    }
+    await saveBlobToDisk(blob, title+"."+info.ext, info.mime);
+    document.getElementById("exportModal").classList.add("hidden");
+    toast(info.desc+" saved");
+  }catch(err){
+    statusEl.textContent = "Save failed: "+(err && err.message ? err.message : "unknown error");
+  }finally{
+    confirmBtn.disabled = false;
+  }
 });
 document.getElementById("loadBtn").addEventListener("click", ()=> document.getElementById("loadInput").click());
 document.getElementById("loadInput").addEventListener("change",(e)=>{
   const file = e.target.files[0]; if(!file) return;
   const reader = new FileReader();
-  reader.onload = ()=>{
-    try{
-      const data = JSON.parse(reader.result);
-      loadProject(data);
-      toast("Project loaded");
-    }catch(err){ toast("Invalid project file"); }
-  };
-  reader.readAsText(file);
+  if(/\.midi?$/i.test(file.name)){
+    reader.onload = ()=>{
+      try{ importMidiTracks(parseMidiFile(reader.result)); }
+      catch(err){ toast("Could not read MIDI file: "+(err && err.message ? err.message : "unknown error")); }
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.onload = ()=>{
+      try{
+        const data = JSON.parse(reader.result);
+        loadProject(data);
+        toast("Project loaded");
+      }catch(err){ toast("Invalid project file"); }
+    };
+    reader.readAsText(file);
+  }
   e.target.value="";
 });
 function loadProject(data){
   STEPS_TOTAL = STEPS_TOTAL_BASE;
+  state.projectTitle = data.projectTitle || "Bit Beats Project";
   state.bpm=data.bpm||120; state.timeSig=data.timeSig||[4,4]; state.key=data.key||"C"; state.mode=data.mode||"Major";
   state.octaveFocus=data.octaveFocus||4; state.noteLenSteps=data.noteLenSteps||4;
   document.getElementById("bpmInput").value=state.bpm;
@@ -2187,6 +3205,7 @@ function loadProject(data){
   document.getElementById("keySel").value=state.key; document.getElementById("modeSel").value=state.mode;
   document.getElementById("octaveSel").value=state.octaveFocus;
   document.getElementById("noteLenSel").value=state.noteLenSteps;
+  renderProjectTitle();
   nextTrackId=1; nextNoteId=1;
   state.tracks = (data.tracks||[]).map(t=>{
     const track = makeTrack(t.name, 0);
@@ -2207,11 +3226,11 @@ function loadProject(data){
   });
   state.selectedTrackId = state.tracks.length? state.tracks[0].id : null;
   state.advancedTrackId = null; state.advancedParam = "volume";
-  selectedNoteIds.clear(); selectedRegionIds.clear(); selectedAutoPointIds.clear();
+  selectedNoteIds.clear(); selectedRegionIds.clear(); selectedAutoPointIds.clear(); phantomSelection = null;
   undoStack=[]; redoStack=[];
   state.loop = {enabled:false, start:0, end:stepsPerBar()};
   sizeGrid(); buildPianoLabels(); drawGridLines();
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
+  renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList(); renderAdvancedEditor();
   recomputeStepsTotal();
   document.getElementById("loopBtn").classList.remove("on");
 }
@@ -2220,10 +3239,61 @@ document.getElementById("newBtn").addEventListener("click", ()=>{
   stopPlayback(true);
   STEPS_TOTAL = STEPS_TOTAL_BASE;
   state.tracks=[]; state.selectedTrackId=null; selectedNoteIds.clear(); selectedRegionIds.clear();
-  state.advancedTrackId=null; selectedAutoPointIds.clear();
+  state.advancedTrackId=null; selectedAutoPointIds.clear(); phantomSelection = null;
   undoStack=[]; redoStack=[];
   initDefaultProject();
 });
+
+/* ======================================================================
+   RESIZABLE PANELS (self-contained local drag handling — these panels are pure
+   layout/UI state, not part of state.tracks, so intentionally kept out of
+   pushHistory()/snapshotTracks() undo-redo and out of the shared drag-state
+   machines used for note/track/automation editing)
+   ====================================================================== */
+function makeResizer(handleEl, targetEl, opts){
+  if(!handleEl || !targetEl) return;
+  const axis = opts.axis; // 'x' or 'y'
+  let dragging = false, startPos = 0, startSize = 0;
+  handleEl.addEventListener("mousedown",(e)=>{
+    dragging = true;
+    startPos = axis==="x" ? e.clientX : e.clientY;
+    const rect = targetEl.getBoundingClientRect();
+    startSize = axis==="x" ? rect.width : rect.height;
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove",(e)=>{
+    if(!dragging) return;
+    const pos = axis==="x" ? e.clientX : e.clientY;
+    let delta = pos-startPos;
+    if(opts.invert) delta = -delta;
+    const newSize = Math.max(opts.min, Math.min(opts.max, startSize+delta));
+    targetEl.style[axis==="x"?"width":"height"] = newSize+"px";
+    if(opts.onResize) opts.onResize();
+  });
+  window.addEventListener("mouseup",()=>{
+    if(dragging && opts.onResize) opts.onResize();
+    dragging = false;
+  });
+}
+makeResizer(document.getElementById("rollDivider"), document.getElementById("advancedEditor"),
+  {axis:"y", min:60, max:400, onResize: renderAdvancedEditor});
+makeResizer(document.getElementById("arrangeDivider"), document.getElementById("arrange"),
+  {axis:"y", min:100, max:520});
+// re-measure (never rebuild) the existing rows when the instrument-list column is widened/narrowed:
+// name widths, control fitting and the pattern preview all key off the row's own measured width
+function refreshInstrumentRowFit(){
+  document.querySelectorAll("#instrumentList .instrumentRow").forEach(row=>{
+    const track = state.tracks.find(t=>t.id===Number(row.dataset.id));
+    sizeNameInput(row.querySelector('input[data-role=name]'));
+    fitRowControls(row);
+    const canvas = row.querySelector(".instrumentRowPattern");
+    if(canvas && track) drawInstrumentRowPattern(track, canvas);
+  });
+}
+makeResizer(document.getElementById("vResizerInstrumentList"), document.getElementById("instrumentListCol"),
+  {axis:"x", min:150, max:520, onResize: refreshInstrumentRowFit});
+makeResizer(document.getElementById("vResizerInstEditor"), document.getElementById("instEditor"),
+  {axis:"x", min:220, max:700, invert:true});
 
 /* ======================================================================
    TOAST
@@ -2238,11 +3308,11 @@ function toast(msg){
    INIT
    ====================================================================== */
 function initDefaultProject(){
-  sizeGrid(); buildPianoLabels();
+  sizeGrid(); buildPianoLabels(); renderProjectTitle();
   const t1 = makeTrack("Lead Square",0); buildChain(t1); state.tracks.push(t1);
   const t2 = makeTrack("Bass Triangle",1); t2.instrument.wave="triangle"; buildChain(t2); state.tracks.push(t2);
   state.selectedTrackId = t1.id;
-  renderTrackList(); refreshInstrumentEditor(); renderNotes(); buildOverview(); renderAdvancedEditor();
+  renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList(); renderAdvancedEditor();
   const midi=(state.octaveFocus+1)*12;
   gridScroll.scrollTop = midiToRow(midi)*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2;
   syncPianoScroll();

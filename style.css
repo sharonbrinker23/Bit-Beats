@@ -25,6 +25,8 @@ button.primary{background:var(--accent); color:#0a1a12; border-color:var(--accen
 button.primary:hover{background:#7cf0bb;}
 button.small{padding:3px 7px; font-size:11px;}
 button.icon{width:26px; height:26px; padding:0; display:inline-flex; align-items:center; justify-content:center;}
+button.icon.flat{background:transparent; border:none; color:#fff; font-size:14px;}
+button.icon.flat:hover{background:rgba(255,255,255,.12); border-radius:5px;}
 select,input[type=number],input[type=text]{
   font-family:inherit; font-size:12px; color:var(--text); background:var(--bg3);
   border:1px solid var(--line-strong); border-radius:5px; padding:4px 6px;
@@ -42,60 +44,175 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 .hgroup:first-of-type{border-left:none;}
 #playBtn{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#0a1a12;font-size:14px;}
 #holdPosBtn{width:30px;height:30px;border-radius:50%;}
+#loopBtn{width:30px;height:30px;border-radius:50%;font-size:15px;}
 #loopBtn.on{background:var(--accent2); color:#071226; border-color:var(--accent2);}
+/* ===== SUB-HEADER: project title + musical settings ===== */
+#subHeader{
+  display:flex; align-items:center; gap:14px; padding:6px 12px; background:var(--bg1);
+  border-bottom:1px solid var(--line); flex-wrap:wrap; row-gap:8px; flex-shrink:0;
+}
+#projectTitleWrap{display:flex; align-items:center; min-width:0; padding-right:2px;}
+/* plain text until double-clicked; the input swapped in during editing is the only state with a
+   visible boundary (see the #projectTitle input rule below) */
+#projectTitle{
+  font-size:13px; font-weight:600; color:var(--text); cursor:text; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis; max-width:280px;
+  padding:3px 6px; border:1px solid transparent; border-radius:5px;
+}
+#projectTitle:hover{border-color:var(--line);}
+#projectTitleWrap input{
+  font-size:13px; font-weight:600; padding:3px 6px; border-radius:5px;
+  border:1px solid var(--accent2); background:var(--bg0); color:var(--text); min-width:120px;
+}
+#projectTitleWrap input:focus{outline:none;}
+#metroBtn{
+  width:26px; height:26px; border-radius:5px; padding:0; color:#fff;
+  display:inline-flex; align-items:center; justify-content:center;
+}
 #metroBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
 #holdPosBtn.on{background:var(--accent3); color:#2a1200; border-color:var(--accent3); font-weight:600;}
 
-/* ===== TRACK OVERVIEW (GarageBand-like arrange area) ===== */
+/* ===== ARRANGE AREA: INSTRUMENT LIST (left) + TRACK LIST (right) ===== */
 #arrange{
   display:flex; background:var(--bg1); border-bottom:1px solid var(--line);
   height:180px; flex-shrink:0;
 }
-#rollDivider{ height:8px; background:var(--bg1); border-bottom:1px solid var(--line); flex-shrink:0; }
-#trackListCol{
-  width:230px; flex-shrink:0; border-right:1px solid var(--line); overflow-y:auto; background:var(--bg2);
+#rollDivider, .hResizer{ height:8px; background:var(--bg1); border-bottom:1px solid var(--line); flex-shrink:0; cursor:row-resize; }
+#rollDivider:hover, .hResizer:hover{ background:#26262e; }
+.vResizer{ width:6px; flex-shrink:0; background:var(--bg1); border-left:1px solid var(--line); border-right:1px solid var(--line); cursor:col-resize; }
+.vResizer:hover{ background:#31313a; }
+#instrumentListCol{
+  width:230px; flex-shrink:0; background:var(--bg2);
+  display:flex; flex-direction:column; overflow:hidden;
 }
-#trackListHeaderSpacer{
-  position:sticky; top:0; z-index:4; height:18px; background:var(--bg1); border-bottom:1px solid var(--line);
+#instrumentListScroll{flex:1; overflow-y:auto;}
+/* the icon bar and the zoom-slider bar beneath it read as ONE continuous footer: same (darker)
+   background as the sliders sit on, no divider between them, and only a couple of pixels of
+   padding around the buttons so the bar hugs them */
+#instrumentToolbar{
+  display:flex; align-items:center; justify-content:flex-start; gap:6px; padding:2px 6px;
+  background:var(--bg2); border-top:1px solid var(--line); flex-shrink:0;
 }
-#trackList{display:flex; flex-direction:column;}
-.trackRow{
-  display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid var(--line);
-  cursor:pointer; height:46px; justify-content:center;
+#instrumentListZoomBar{
+  display:flex; align-items:center; gap:6px; padding:3px 8px; background:var(--bg2);
+  flex-shrink:0;
 }
-.trackRow.selected{background:#232a26; box-shadow:inset 3px 0 0 var(--accent);}
-.trackRow .tname{font-weight:600; font-size:12px; display:flex; align-items:center; gap:6px;}
-.trackRow .tname input{background:transparent;border:none;color:var(--text);font-weight:600;font-size:12px;width:100%;padding:0;}
-.trackRow .tctrls{display:flex; align-items:center; gap:5px;}
-.trackRow .swatch{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+#instrumentListZoomBar .zoomBarIcon{
+  font-size:11px; color:var(--text-dim); flex-shrink:0; width:11px; text-align:center;
+}
+#instrumentListZoomBar input[type=range]{flex:1 1 auto; min-width:0;}
+
+/* ===== custom thin-line range sliders for the instrument-list zoom bar ===== */
+#instrumentListZoomBar input[type=range]{
+  -webkit-appearance:none; appearance:none; background:transparent; height:16px; margin:0;
+}
+#instrumentListZoomBar input[type=range]::-webkit-slider-runnable-track{
+  height:3px; background:var(--text-dim); border-radius:2px;
+}
+#instrumentListZoomBar input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none; width:3px; height:15px; border-radius:1px;
+  background:#fff; border:none; margin-top:-6px; cursor:pointer;
+}
+#instrumentListZoomBar input[type=range]::-moz-range-track{
+  height:3px; background:var(--text-dim); border-radius:2px;
+}
+#instrumentListZoomBar input[type=range]::-moz-range-thumb{
+  width:3px; height:15px; border-radius:1px; background:#fff; border:none; cursor:pointer;
+}
+/* must clear exactly as much vertical space as the track list's own sticky chrome (#loopBar 12px
+   + #trackListRuler 18px), or every instrument row sits offset from the track row beside it */
+#instrumentListHeaderSpacer{
+  position:sticky; top:0; z-index:4; height:30px; background:var(--bg1); border-bottom:1px solid var(--line);
+}
+#instrumentList{display:flex; flex-direction:column;}
+/* Instrument rows are deliberately PLAIN: no track-colored wash, no colored header strip — that
+   treatment now lives on the track-preview blocks in the track list (see .trackBlock). Selection is
+   the only decoration: a subtle background tint plus a green accent bar down the row's left edge. */
+.instrumentRow{
+  display:flex; flex-direction:column; gap:0; padding:0; border-bottom:1px solid var(--line);
+  cursor:pointer; height:46px; justify-content:flex-start; position:relative; z-index:0; overflow:hidden;
+}
+.instrumentRowPattern{position:absolute; inset:0; width:100%; height:100%; z-index:-1; pointer-events:none;}
+.instrumentRow.selected{background:#232a26; box-shadow:inset 3px 0 0 var(--accent); z-index:1;}
+.instrumentRow .tname{
+  position:relative; z-index:1; height:var(--hdrh,22px); flex-shrink:0;
+  display:flex; align-items:center; gap:6px; padding:0 8px; min-width:0; flex:0 1 auto;
+  color:var(--text); font-weight:700; font-size:11px;
+}
+/* the name renders as plain text until it's double-clicked (see the #instrumentList dblclick handler),
+   at which point it's swapped for a real <input> that shows its own visible border while editing.
+   Width is assigned in JS (sizeNameInput) from the measured text, so the box hugs its text instead
+   of stretching into a big empty clickable strip. */
+.instrumentRow .tname .nameText{
+  cursor:text; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:10px;
+  padding:1px 2px; border:1px solid transparent;
+}
+.instrumentRow .tname input{
+  background:var(--bg0); border:1px solid var(--accent2); border-radius:3px; color:inherit;
+  font-weight:inherit; font-size:inherit; width:auto; min-width:10px; max-width:100%;
+  padding:0 2px; flex:0 1 auto; text-overflow:ellipsis;
+}
+.instrumentRow .tname input:focus{outline:none;}
+.instrumentRow .tctrls{
+  position:relative; z-index:1; display:flex; align-items:center; gap:5px; padding:0 8px;
+  flex:1 1 auto; min-height:0;
+}
+.instrumentRow .tctrls select[data-role=wave]{flex:1 1 auto; min-width:0; font-size:10px; padding:1px 2px;}
+.instrumentRow .tctrls input[type=range][data-role=vol]{width:40px; flex-shrink:0;}
+.instrumentRow .tctrls .mutebtn, .instrumentRow .tctrls .solobtn{flex-shrink:0;}
+/* ---- single-line (shrunk) rows: controls move to the RIGHT of the name, header fills the row ---- */
+.instrumentRow.oneline{flex-direction:row; align-items:center;}
+.instrumentRow.oneline .tname{height:100%; padding:0 0 0 6px;}
+.instrumentRow.oneline .tctrls{flex:0 0 auto; margin-left:auto; height:100%; gap:4px; padding:0 6px 0 6px;}
+.instrumentRow.oneline .tctrls select[data-role=wave]{flex:0 0 auto; width:64px;}
+/* progressive waveform-select abbreviation (see fitRowControls/applyWaveTier in app.js) */
+.instrumentRow .tctrls select[data-role=wave].wtier1{flex:0 0 auto; width:34px;}
+.instrumentRow .tctrls select[data-role=wave].wtier2{flex:0 0 auto; width:22px; padding-left:0; padding-right:0;}
+.instrumentRow .tctrls input[type=range][data-role=vol].volNarrow{width:26px;}
+.instrumentRow .swatch{width:9px;height:9px;border-radius:50%;flex-shrink:0;cursor:pointer;}
+.instrumentRow .swatch:hover{outline:2px solid #fff;}
+/* selection is signalled by the row's own tint + accent bar — kill any incidental focus ring that
+   would read as "the instrument / waveform picker got selected too" */
+.instrumentRow select:focus, .instrumentRow button:focus, .instrumentRow input:focus{outline:none;}
+.instrumentRow select:focus-visible{outline:1px solid var(--accent2); outline-offset:-1px;}
+#instEditor, #instEditor *{outline:none;}
+#instEditor :focus-visible{outline:1px solid var(--accent2); outline-offset:1px;}
 .mutebtn,.solobtn{width:18px;height:18px;font-size:9px;padding:0;border-radius:3px;}
 .mutebtn.on{background:var(--danger); color:#2a0000; border-color:var(--danger);}
 .solobtn.on{background:var(--warn); color:#2a1e00; border-color:var(--warn);}
-#addTrackBtn{margin:8px; }
-
-#timelineCol{flex:1; overflow:auto; position:relative;}
-#timelineInner{position:relative;}
-#arrangeRuler{
+#trackListCol{flex:1; overflow:auto; position:relative;}
+#trackListInner{position:relative;}
+#trackListRuler{
   position:sticky; top:12px; height:18px; z-index:4; background:var(--bg1); border-bottom:1px solid var(--line);
 }
-.timelineRow{
-  height:46px; border-bottom:1px solid var(--line); position:relative; background-image:
+.trackRow{
+  height:46px; border-bottom:1px solid var(--line); position:relative; overflow:hidden; background-image:
     repeating-linear-gradient(to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent var(--barpx));
 }
-.overviewBlock{
-  position:absolute; top:6px; height:34px; border-radius:4px; opacity:.9;
-  display:flex; align-items:center; padding:0 6px; font-size:10px; overflow:hidden; white-space:nowrap;
+/* A track-preview block mirrors the advanced editor's lane card: an OPAQUE track-colored header
+   strip (.trackBlockHeader, carrying the track name) stacked on a TRANSLUCENT track-colored body
+   (the block's own background, set inline by renderTrackBlock as rgba(track.color,.35)), with the
+   mini note-pattern canvas floating over that body but under the header. */
+.trackBlock{
+  position:absolute; border-radius:5px; opacity:.95;
+  display:flex; flex-direction:column; padding:0; font-size:10px; overflow:hidden; white-space:nowrap;
   border:1px solid rgba(0,0,0,.35); cursor:grab;
 }
-.overviewBlock.dragging{cursor:grabbing; opacity:1; box-shadow:0 0 0 2px #fff;}
-.overviewBlock.regionSelected{outline:2px solid #fff; opacity:1; z-index:2;}
+.trackBlockHeader{
+  position:relative; z-index:2; flex-shrink:0; display:flex; align-items:center; padding:0 6px;
+  color:#111; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  border-radius:4px 4px 0 0; pointer-events:none;
+}
+.trackBlockPattern{position:absolute; left:0; z-index:1; pointer-events:none;}
+.trackBlock.dragging{cursor:grabbing; opacity:1; box-shadow:0 0 0 2px #fff;}
+.trackBlock.regionSelected{outline:2px solid #fff; opacity:1; z-index:2;}
 .blockHandle{position:absolute; top:0; width:8px; height:100%; cursor:ew-resize; z-index:2;}
 .blockHandleL{left:-2px;} .blockHandleR{right:-2px;}
-.overviewBlock:hover .blockHandle{background:rgba(255,255,255,.25);}
-#playheadOverview{position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none;}
-/* the flag is a separate element (see #playheadOverviewFlag) kept pinned to the visible scroll
-   position via JS, rather than a pseudo-element anchored to the (possibly scrolled-away) top of #playheadOverview */
-#playheadOverviewFlag{
+.trackBlock:hover .blockHandle{background:rgba(255,255,255,.25);}
+#trackListPlayhead{position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none;}
+/* the flag is a separate element (see #trackListPlayheadFlag) kept pinned to the visible scroll
+   position via JS, rather than a pseudo-element anchored to the (possibly scrolled-away) top of #trackListPlayhead */
+#trackListPlayheadFlag{
   position:absolute; width:14px; height:13px; background:#fff; z-index:7; pointer-events:none;
   clip-path:polygon(0% 0%, 100% 0%, 100% 55%, 50% 100%, 0% 55%);
   box-shadow:0 0 4px rgba(255,255,255,.7);
@@ -103,14 +220,15 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 
 /* ===== INSTRUMENT EDITOR ===== */
 #instEditor{
-  width:460px; flex-shrink:0; display:flex; flex-direction:column; justify-content:flex-start; gap:5px;
-  padding:8px 14px; background:var(--bg1); border-left:1px solid var(--line); overflow:hidden;
+  width:460px; flex-shrink:0; display:flex; flex-direction:column; align-items:stretch; gap:5px;
+  padding:8px 14px; background:var(--bg1); overflow:hidden;
 }
-.instTopRow{display:flex; align-items:flex-end; gap:10px;}
-.instTopRow .field{flex-shrink:0;}
+.instTopRow{
+  display:flex; flex-direction:row; align-items:flex-end; gap:10px; flex-shrink:0; overflow:hidden;
+}
 #instTrackName{
   color:var(--text); font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden;
-  text-overflow:ellipsis; max-width:110px; display:inline-block;
+  text-overflow:ellipsis; max-width:150px; display:inline-block;
 }
 .instSliders{display:grid; grid-template-columns:repeat(3,1fr); gap:2px 12px;}
 .instFooter{display:flex; align-items:flex-end; gap:10px; justify-content:space-between;}
@@ -183,6 +301,10 @@ canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
   box-shadow:0 1px 2px rgba(0,0,0,.4);
 }
 .note.selected{outline:2px solid #fff; z-index:3;}
+#phantomCell{
+  position:absolute; border:2px dashed #fff; border-radius:3px; z-index:3; pointer-events:none;
+  box-sizing:border-box; background:rgba(255,255,255,.08);
+}
 .bendHandle{position:absolute; right:-3px; top:0; width:7px; height:100%; cursor:crosshair; z-index:4;}
 .leftHandle{position:absolute; left:-3px; top:0; width:7px; height:100%; cursor:ew-resize; z-index:4;}
 .note:hover .bendHandle, .note:hover .leftHandle{background:rgba(255,255,255,.3); border-radius:2px;}
@@ -209,7 +331,7 @@ canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
    Horizontal placement must come from `transform`, not `left`: giving a sticky element any non-auto
    inset (including left) makes the browser stick that axis too, so a JS-driven `left` here would freeze
    the grip in the viewport instead of scrolling with the grid whenever it's scrolled programmatically
-   (e.g. jumping the playhead from the tracklist auto-scrolls the grid out from under it).
+   (e.g. jumping the playhead from the track list auto-scrolls the grid out from under it).
    margin-top cancels out #gridRuler's reserved 18px of flow height above it: without this, the grip's
    natural (unstuck) resting spot is 18px down — below the ruler, at the very first note row — so at
    scrollTop 0 it sits outside the header and only slides up into the ruler band once you've scrolled
@@ -219,7 +341,7 @@ canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
   pointer-events:auto; cursor:ew-resize; box-shadow:0 0 4px rgba(255,255,255,.7); z-index:7;
   margin-left:-7px; margin-top:-18px;
 }
-#playheadOverview{cursor:ew-resize;}
+#trackListPlayhead{cursor:ew-resize;}
 #loopBar{
   position:sticky; top:0; height:12px; z-index:6; background:var(--bg1); border-bottom:1px solid var(--line);
 }
@@ -249,3 +371,44 @@ canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
   border-radius:6px; font-size:12px; z-index:100; opacity:0; transition:opacity .2s; pointer-events:none;
 }
 #toast.show{opacity:.92;}
+
+/* ===== TRACK COLOR PICKER ===== */
+#colorPicker{
+  position:fixed; z-index:300; background:var(--bg2); border:1px solid var(--line-strong); border-radius:8px;
+  padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.5); display:flex; flex-direction:column; gap:8px; width:150px;
+}
+#colorPalette{display:grid; grid-template-columns:repeat(4,1fr); gap:6px;}
+.colorSwatchBtn{
+  width:28px; height:28px; border-radius:50%; border:1px solid rgba(0,0,0,.4); cursor:pointer; padding:0;
+}
+.colorSwatchBtn:hover{outline:2px solid #fff;}
+#colorCustomPanel{display:flex; flex-direction:column; gap:8px;}
+#colorSVWrap, #colorHueWrap{position:relative; cursor:crosshair;}
+#colorSVCanvas, #colorHueCanvas{display:block; border-radius:4px; width:100%;}
+#colorSVDot{
+  position:absolute; width:10px; height:10px; margin-left:-5px; margin-top:-5px; border-radius:50%;
+  border:2px solid #fff; box-shadow:0 0 2px rgba(0,0,0,.8); pointer-events:none;
+}
+#colorHueDot{
+  position:absolute; top:-2px; width:4px; height:18px; margin-left:-2px; background:#fff;
+  box-shadow:0 0 2px rgba(0,0,0,.8); pointer-events:none;
+}
+
+/* ===== SAVE / EXPORT MODAL ===== */
+.modalOverlay{
+  position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:200;
+}
+.modalBox{
+  background:var(--bg1); border:1px solid var(--line-strong); border-radius:10px; padding:20px;
+  width:300px; display:flex; flex-direction:column; gap:12px; box-shadow:0 8px 30px rgba(0,0,0,.5);
+}
+.modalBox h3{margin:0; font-size:14px;}
+.modalField input, .modalField select{width:100%;}
+.modalStatus{font-size:11px; color:var(--text-dim); min-height:14px; line-height:1.45;}
+.loopField{display:flex; align-items:flex-end; gap:12px;}
+.checkRow{display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text); cursor:pointer;}
+.checkRow input[type=checkbox]{accent-color:var(--accent); width:14px; height:14px; margin:0; cursor:pointer;}
+.loopCountField{flex:0 0 auto;}
+.loopCountField input{width:64px;}
+.loopCountField input:disabled{opacity:.45;}
+.modalActions{display:flex; justify-content:flex-end; gap:8px;}
