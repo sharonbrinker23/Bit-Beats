@@ -7,6 +7,10 @@
   --row-a:#1b1b21; --row-b:#202027; --row-c:#25252d;
   --row-light:#2c2c34; --row-dark:#1c1c22; --row-c:rgba(111,168,255,.18);
   --row-c3:#34343e;
+  /* the rule between a docked side panel and the advanced editor's own content. One step lighter than
+     --line-strong on purpose: it separates two live menus rather than two rows of the same list, so it
+     has to read as a deliberate light-gray divider instead of the app's usual near-invisible hairline */
+  --dock-line:#5a5a66;
 }
 *{box-sizing:border-box;}
 html,body{height:100%;}
@@ -32,6 +36,17 @@ select,input[type=number],input[type=text]{
   border:1px solid var(--line-strong); border-radius:5px; padding:4px 6px;
 }
 input[type=range]{accent-color:var(--accent);}
+/* ===== no sticky "still selected" look on any clicked control =====
+   App-wide generalisation of the .instrumentRow / #instEditor rules further down: a control that was
+   merely CLICKED must leave no focus ring behind, because a lingering ring on a button or dropdown
+   reads as persistent on/selected state (the app already has real toggles for that — .on / .active —
+   and those are class-driven, so they are untouched here). Keyboard focus is deliberately NOT killed:
+   :focus-visible only matches when the browser judges the focus keyboard-driven, so tabbing still
+   draws a clear ring and the app stays navigable without a mouse. The matching blur pass lives in
+   app.js (mouseup for buttons/sliders, change/next-mousedown for selects) — CSS alone can hide the
+   ring but the control would still be eating Delete/arrow keypresses meant for the note editor. */
+button:focus, select:focus, input[type=range]:focus{outline:none;}
+button:focus-visible, select:focus-visible, input[type=range]:focus-visible{outline:1px solid var(--accent2); outline-offset:1px;}
 label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.04em;}
 
 /* ===== HEADER ===== */
@@ -42,6 +57,10 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 #logo{font-weight:800; font-size:16px; letter-spacing:.02em; color:var(--accent); margin-right:6px; white-space:nowrap;}
 .hgroup{display:flex; align-items:flex-end; gap:8px; padding:0 8px; border-left:1px solid var(--line);}
 .hgroup:first-of-type{border-left:none;}
+/* icon-only undo/redo: .icon already boxes them at 26x26, but they share a flex-end group with the
+   New / Save / Load text buttons whose height comes from their own line box — state the same 26px
+   here so a platform font-metric difference can never leave the two kinds of button a pixel apart */
+#undoBtn, #redoBtn{height:26px; align-self:flex-end;}
 #playBtn{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#0a1a12;font-size:14px;}
 #holdPosBtn{width:30px;height:30px;border-radius:50%;}
 #loopBtn{width:30px;height:30px;border-radius:50%;font-size:15px;}
@@ -51,12 +70,21 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
   display:flex; align-items:center; gap:14px; padding:6px 12px; background:var(--bg1);
   border-bottom:1px solid var(--line); flex-wrap:wrap; row-gap:8px; flex-shrink:0;
 }
-#projectTitleWrap{display:flex; align-items:center; min-width:0; padding-right:2px;}
+/* the groups inside the sub-header read as ONE continuous strip of musical settings, so they get no
+   vertical rules between them (the #header groups above keep theirs). The side padding drops to 4px
+   because it no longer has to hold a line off its neighbours — 4 + the 14px flex gap + 4 still leaves
+   a group break noticeably wider than the 8px gap between controls inside a group. */
+#subHeader .hgroup{border-left:none; padding:0 4px;}
+/* width is assigned by syncSubHeaderLayout() so the BPM group lands at a computed x — never let flex
+   shrink it back out of that position */
+#projectTitleWrap{display:flex; align-items:center; min-width:0; padding-right:2px; flex-shrink:0;}
 /* plain text until double-clicked; the input swapped in during editing is the only state with a
-   visible boundary (see the #projectTitle input rule below) */
+   visible boundary (see the #projectTitle input rule below).
+   No max-width here on purpose: syncSubHeaderLayout() sets it every time the title or the window
+   changes, since the cap is whatever keeps the title SUBHEADER_TITLE_GAP_PX clear of the BPM field. */
 #projectTitle{
   font-size:13px; font-weight:600; color:var(--text); cursor:text; white-space:nowrap;
-  overflow:hidden; text-overflow:ellipsis; max-width:280px;
+  overflow:hidden; text-overflow:ellipsis;
   padding:3px 6px; border:1px solid transparent; border-radius:5px;
 }
 #projectTitle:hover{border-color:var(--line);}
@@ -70,6 +98,13 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
   display:inline-flex; align-items:center; justify-content:center;
 }
 #metroBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+/* pushed to the far right of the row by margin-left:auto — that is deliberately the ONLY thing holding
+   its position, so syncSubHeaderLayout()'s title/BPM measurement stays untouched by it. align-self:stretch
+   + flex-end drops the button onto the same baseline as the Key/Mode/Octave selects, which sit at the
+   bottom of their own flex-end groups under their little uppercase captions. */
+#chordMenuWrap{margin-left:auto; align-self:stretch; display:flex; align-items:flex-end; padding:0 4px; flex-shrink:0;}
+#chordMenuBtn{height:26px; padding:0 10px; font-size:11px; white-space:nowrap;}
+#chordMenuBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
 #holdPosBtn.on{background:var(--accent3); color:#2a1200; border-color:var(--accent3); font-weight:600;}
 
 /* ===== ARRANGE AREA: INSTRUMENT LIST (left) + TRACK LIST (right) ===== */
@@ -132,7 +167,6 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
   display:flex; flex-direction:column; gap:0; padding:0; border-bottom:1px solid var(--line);
   cursor:pointer; height:46px; justify-content:flex-start; position:relative; z-index:0; overflow:hidden;
 }
-.instrumentRowPattern{position:absolute; inset:0; width:100%; height:100%; z-index:-1; pointer-events:none;}
 .instrumentRow.selected{background:#232a26; box-shadow:inset 3px 0 0 var(--accent); z-index:1;}
 .instrumentRow .tname{
   position:relative; z-index:1; height:var(--hdrh,22px); flex-shrink:0;
@@ -174,7 +208,10 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 /* selection is signalled by the row's own tint + accent bar — kill any incidental focus ring that
    would read as "the instrument / waveform picker got selected too" */
 .instrumentRow select:focus, .instrumentRow button:focus, .instrumentRow input:focus{outline:none;}
-.instrumentRow select:focus-visible{outline:1px solid var(--accent2); outline-offset:-1px;}
+/* the mute/solo buttons and the volume slider need the keyboard ring restored here too — the :focus
+   rule above out-specifies the global :focus-visible rule at the top of the file, so without this a
+   tabbing user would land on them completely blind */
+.instrumentRow select:focus-visible, .instrumentRow button:focus-visible, .instrumentRow input:focus-visible{outline:1px solid var(--accent2); outline-offset:-1px;}
 #instEditor, #instEditor *{outline:none;}
 #instEditor :focus-visible{outline:1px solid var(--accent2); outline-offset:1px;}
 .mutebtn,.solobtn{width:18px;height:18px;font-size:9px;padding:0;border-radius:3px;}
@@ -206,9 +243,6 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 .trackBlockPattern{position:absolute; left:0; z-index:1; pointer-events:none;}
 .trackBlock.dragging{cursor:grabbing; opacity:1; box-shadow:0 0 0 2px #fff;}
 .trackBlock.regionSelected{outline:2px solid #fff; opacity:1; z-index:2;}
-.blockHandle{position:absolute; top:0; width:8px; height:100%; cursor:ew-resize; z-index:2;}
-.blockHandleL{left:-2px;} .blockHandleR{right:-2px;}
-.trackBlock:hover .blockHandle{background:rgba(255,255,255,.25);}
 #trackListPlayhead{position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none;}
 /* the flag is a separate element (see #trackListPlayheadFlag) kept pinned to the visible scroll
    position via JS, rather than a pseudo-element anchored to the (possibly scrolled-away) top of #trackListPlayhead */
@@ -226,6 +260,22 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 .instTopRow{
   display:flex; flex-direction:row; align-items:flex-end; gap:10px; flex-shrink:0; overflow:hidden;
 }
+/* .squeezed is the LAST resort, applied by fitInstTopRow only once both buttons have already shrunk to
+   their one-character floor: up to that point the Track / Waveform fields hold at their natural size and
+   the buttons do all the giving (that is the shrink the user is dragging for), and only then do these
+   two fields start yielding — which is what keeps the buttons from being clipped off the end of the row
+   at the panel's minimum width. Both truncate gracefully: #instTrackName ellipsises, the select drops
+   back to its bare dropdown arrow. */
+.instTopRow.squeezed > label.field{min-width:0;}
+/* fitInstTopRow() owns these two labels: nowrap so "Upload Sample" can't quietly wrap to two lines
+   instead of reporting an overflow, and no flex-shrink so the row's measured overflow is a true
+   "these need N more px" signal rather than the buttons silently squashing their own text */
+#advToggleBtn, #uploadSampleBtn, #sampleMenuBtn{white-space:nowrap; flex:0 0 auto;}
+/* a bare <select> sizes itself to its WIDEST option, so a long sample filename in the custom section of
+   the list would silently drag this field (and the whole top row with it) out past the panel's edge.
+   The cap is what makes fitSampleLabel's budget a real number: the select can no longer grow to swallow
+   any name, so a name that doesn't fit gets its "…" instead of quietly stealing the buttons' space. */
+#waveSel{max-width:150px;}
 #instTrackName{
   color:var(--text); font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; max-width:150px; display:inline-block;
@@ -234,7 +284,7 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
 .instFooter{display:flex; align-items:flex-end; gap:10px; justify-content:space-between;}
 .slidergroup{display:flex; flex-direction:column; gap:2px;}
 .slidergroup .val{font-size:10px; color:var(--text-dim);}
-#advToggleBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+#advToggleBtn.on, #sampleMenuBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
 
 /* ===== ADVANCED TRACK EDITOR (AUTOMATION) ===== */
 #advancedEditor{
@@ -245,9 +295,16 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
   width:140px; flex-shrink:0; display:flex; flex-direction:column; gap:10px; padding:2px 0;
   box-sizing:border-box; transform:translateY(-10px);
 }
+/* bare ✕ glyph — no button chrome at rest, so it doesn't compete with the parameter tabs below it.
+   The gray rounded container only materialises under the pointer (and on keyboard focus, which
+   otherwise has no affordance at all here), matching button.icon.flat's hover treatment above.
+   box-sizing:border-box is global, so dropping the border leaves the 22x22 box unchanged. */
 #advCloseBtn{
-  align-self:flex-start; width:22px; height:22px; padding:0; border-radius:50%; font-size:11px; flex-shrink:0;
+  align-self:flex-start; width:22px; height:22px; padding:0; font-size:11px; flex-shrink:0;
+  background:transparent; border:none; color:var(--text); border-radius:5px;
+  display:inline-flex; align-items:center; justify-content:center;
 }
+#advCloseBtn:hover, #advCloseBtn:focus-visible{background:rgba(255,255,255,.12); border-radius:5px;}
 #advTabGrid{
   flex:1; display:grid; grid-template-columns:repeat(2,1fr); grid-auto-rows:min-content;
   align-content:center; gap:6px;
@@ -270,6 +327,97 @@ label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:
   background:#fff; border:1px solid rgba(0,0,0,.5); cursor:grab; z-index:2;
 }
 .autoPoint.selected{outline:2px solid var(--accent2); z-index:3;}
+
+/* ===== DOCK SLOTS INSIDE THE ADVANCED EDITOR =====
+   Two fixed-width columns that a floating panel can be re-parented into (see registerDockPanel in
+   app.js). Each carries the divider on the edge that faces the editor's own content, so left and right
+   docks both read as "this menu, then a rule, then the automation lane". overflow:hidden is what forces
+   the panel inside to scroll ITSELF rather than spilling out when #rollDivider drags the editor down to
+   its 60px minimum — the slot is only ever as tall as the editor's content box. */
+.advDock{flex:0 0 auto; width:244px; display:flex; align-items:stretch; min-width:0; overflow:hidden;}
+#advDockLeft{padding-right:12px; border-right:1px solid var(--dock-line);}
+#advDockRight{padding-left:12px; border-left:1px solid var(--dock-line);}
+
+/* ===== CHORD PALETTE =====
+   One element, two presentations. .floating is the #colorPicker treatment (fixed, own card, JS-placed
+   under the trigger); .docked strips all of that back off so the panel is just a plain column inside
+   the advanced editor's own card. Everything below the two variants is shared, so the grids look
+   identical in both homes. */
+#chordPanel{display:flex; flex-direction:column; gap:6px; font-size:11px;}
+#chordPanel.floating{
+  position:fixed; z-index:300; width:252px; max-height:70vh; overflow-y:auto;
+  background:var(--bg2); border:1px solid var(--line-strong); border-radius:8px;
+  padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+}
+#chordPanel.docked{
+  flex:1 1 auto; min-width:0; height:100%; overflow-y:auto; padding:0 6px 0 0;
+  background:transparent; border:none; border-radius:0; box-shadow:none;
+}
+.chordPanelHead{display:flex; align-items:baseline; justify-content:space-between; gap:8px; flex-shrink:0;}
+.chordPanelTitle{font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim);}
+#chordKeyLabel{font-size:10px; font-weight:700; color:var(--accent); white-space:nowrap;}
+.chordSection{display:flex; flex-direction:column; gap:3px; flex-shrink:0;}
+.chordSectionLabel{font-size:9px; text-transform:uppercase; letter-spacing:.05em; color:var(--text-dim);}
+#chordRootGrid{display:grid; grid-template-columns:repeat(6,1fr); gap:2px;}
+#chordQualityGrid{display:grid; grid-template-columns:repeat(5,1fr); gap:2px;}
+#chordDiatonicGrid{display:grid; grid-template-columns:repeat(7,1fr); gap:2px;}
+/* .advTabBtn's look, shrunk: same chrome and the same blue "this one is picked" fill, but sized for a
+   6/5/7-column grid inside a 165px-tall panel instead of a 2-column tab strip */
+.chordBtn{
+  padding:3px 2px; font-size:10px; line-height:1.15; border-radius:4px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.chordBtn.active{background:var(--accent2); color:#071226; border-color:var(--accent2); font-weight:600;}
+/* the root row is the KEY-ish axis of the palette, so it takes the mint accent rather than the blue —
+   that keeps root and quality visually distinguishable when both are lit at once */
+#chordRootGrid .chordBtn.active{background:var(--accent); color:#0a1a12; border-color:var(--accent);}
+/* a degree tile is two stacked lines (roman numeral over the chord's spelled name), so it can't rely on
+   the button's own line box — it becomes a tiny flex column instead */
+.chordDegBtn{display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1px; padding:2px 1px;}
+.chordDegBtn .deg{font-size:9px; line-height:1; color:var(--text-dim);}
+.chordDegBtn .nm{font-size:10px; line-height:1.1; font-weight:700;}
+.chordDegBtn.active .deg, .chordDegBtn.active .nm{color:#071226;}
+
+/* ===== CUSTOM SAMPLE MANAGER =====
+   Deliberately a copy of the chord palette's two presentations, so the two dock panels read as siblings
+   in the advanced editor rather than as two different kinds of thing that happen to sit side by side.
+   Only the docked padding is mirrored: #advDockLeft owns the gap on the chord panel's divider side, and
+   #advDockRight already supplies this panel's left gap, so all that is needed here is a little room on
+   the right for the internal scrollbar. overflow-y:auto on both variants is what lets the list scroll
+   inside itself when #rollDivider drags the editor down to its 60px minimum. */
+#samplePanel{display:flex; flex-direction:column; gap:6px; font-size:11px;}
+#samplePanel.floating{
+  position:fixed; z-index:300; width:252px; max-height:70vh; overflow-y:auto;
+  background:var(--bg2); border:1px solid var(--line-strong); border-radius:8px;
+  padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+}
+#samplePanel.docked{
+  flex:1 1 auto; min-width:0; height:100%; overflow-y:auto; padding:0 4px 0 0;
+  background:transparent; border:none; border-radius:0; box-shadow:none;
+}
+.samplePanelHead{display:flex; align-items:baseline; justify-content:space-between; gap:8px; flex-shrink:0;}
+.samplePanelTitle{font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim);}
+#sampleCountLabel{font-size:10px; font-weight:700; color:var(--accent); white-space:nowrap;}
+#sampleList{display:flex; flex-direction:column; gap:3px;}
+/* a row is exactly two things: the play button, then the title. The title takes every pixel the button
+   doesn't, and min-width:0 is what lets it ellipsise instead of pushing the row wider than the dock. */
+.sampleRow{display:flex; align-items:center; gap:6px; min-width:0; flex-shrink:0;}
+.samplePlayBtn{
+  flex:0 0 auto; width:20px; height:20px; padding:0; display:inline-flex; align-items:center;
+  justify-content:center; font-size:9px; line-height:1; border-radius:4px;
+  background:#4a4a55; border-color:#5a5a66; color:var(--text);
+}
+.samplePlayBtn:hover{background:#5a5a66;}
+/* the rename idiom's two states: no border while displaying (so the row reads as a label, not a form),
+   a visible one while editing — same contract as .instrumentRow .tname's span/input pair */
+.sampleNameText{
+  flex:1 1 auto; min-width:0; padding:2px 4px; border:1px solid transparent; border-radius:4px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:text;
+}
+.sampleNameText:hover{border-color:var(--line);}
+.sampleRow input[data-role=sampleName]{
+  flex:1 1 auto; min-width:0; width:auto; font-size:11px; padding:2px 4px; border-radius:4px;
+}
 
 /* ===== PIANO ROLL ===== */
 #rollWrap{flex:1; display:flex; overflow:hidden; position:relative;}

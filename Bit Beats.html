@@ -22,8 +22,23 @@
   </div>
 
   <div class="hgroup" style="margin-left:auto;">
-    <button id="undoBtn" title="Undo (Ctrl+Z)">&#8630; Undo</button>
-    <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">&#8631; Redo</button>
+    <!-- undo / redo are drawn as inline SVG rather than the ↶ / ↷ glyphs they replace: those two
+         codepoints render at wildly different weights and sizes per platform font (and are missing
+         outright on some), while a hand-written path is identical everywhere. Each is a 300° ring
+         band with the arrowhead cut at the top — undo sweeps anticlockwise and points LEFT, redo is
+         the mirror image and points RIGHT. -->
+    <button id="undoBtn" class="icon" title="Undo (Ctrl+Z)">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+        <path d="M4.9 8.7A8.2 8.2 0 1 0 12 4.6L12 7A5.8 5.8 0 1 1 6.98 9.9Z"/>
+        <path d="M12 3 12 8.6 7.2 5.8Z"/>
+      </svg>
+    </button>
+    <button id="redoBtn" class="icon" title="Redo (Ctrl+Shift+Z)">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+        <path d="M19.1 8.7A8.2 8.2 0 1 1 12 4.6L12 7A5.8 5.8 0 1 0 17.02 9.9Z"/>
+        <path d="M12 3 12 8.6 16.8 5.8Z"/>
+      </svg>
+    </button>
     <button id="newBtn">New</button>
     <button id="saveBtn" class="primary">Save</button>
     <button id="loadBtn">Load</button>
@@ -81,6 +96,14 @@
       <select id="octaveSel"></select>
     </label>
   </div>
+
+  <!-- chord palette trigger. Deliberately NOT a .hgroup: syncSubHeaderLayout() measures
+       sub.querySelector(".hgroup") to place the BPM field, and a wrapper that can never match that
+       query can never perturb it. margin-left:auto (in CSS) is what parks it on the right, so it also
+       stays out of the title/BPM run of space entirely. -->
+  <div id="chordMenuWrap">
+    <button id="chordMenuBtn" title="Chord palette for the current key">Chords</button>
+  </div>
 </div>
 
 <!-- ============ ARRANGE: INSTRUMENT LIST + TRACK LIST ============ -->
@@ -101,7 +124,10 @@
       <span class="zoomBarIcon" title="Track row height (vertical shrink)">&#8597;</span>
       <input type="range" id="instrumentRowHeightSlider" min="34" max="90" value="46" title="Track row height (vertical shrink)">
       <span class="zoomBarIcon" title="Track zoom (horizontal)">&#8596;</span>
-      <input type="range" id="trackZoomSlider" min="20" max="160" value="60" title="Track zoom (horizontal)">
+      <!-- min/max must match BAR_PX_MIN/BAR_PX_MAX in app.js: setTrackZoom() writes the zoom the
+           ctrl+wheel pinch gesture landed on back into this slider, so a narrower range here would
+           silently pin the thumb short of the real zoom the track list is actually showing -->
+      <input type="range" id="trackZoomSlider" min="20" max="200" value="60" title="Track zoom (horizontal)">
     </div>
   </div>
   <div id="vResizerInstrumentList" class="vResizer" title="Drag to resize"></div>
@@ -125,11 +151,19 @@
           <option value="sawtooth">Sawtooth</option>
           <option value="sine">Sine</option>
           <option value="noise">Noise (Drum)</option>
-          <option value="custom">Custom Sample</option>
+          <!-- data-sample marks the "custom" end of the list as JS-owned: syncWaveCustomOptions()
+               replaces everything carrying that attribute with one option per uploaded sample, and
+               only re-emits this generic entry when the registry can't name one -->
+          <option value="custom" data-sample="generic">Custom Sample</option>
         </select>
       </label>
-      <button id="advToggleBtn" class="small" title="Advanced track editor (automation)">Advanced&hellip;</button>
-      <button id="uploadSampleBtn" class="small">Upload Sample&hellip;</button>
+      <!-- labels are the FULL words on purpose: the trailing "…" is no longer decorative, it is added
+           by fitInstTopRow() only when the panel got too narrow to show the whole word -->
+      <button id="advToggleBtn" class="small" title="Advanced track editor (automation)">Advanced</button>
+      <button id="uploadSampleBtn" class="small" title="Upload a custom sample">Upload Sample</button>
+      <!-- starts hidden and is revealed by updateSampleMenuBtn() as soon as the project has an upload;
+           its label joins the same truncation set as the two above (see fitInstTopRow) -->
+      <button id="sampleMenuBtn" class="small hidden" title="Manage the project's uploaded samples">Samples</button>
       <span id="sampleName" style="font-size:10px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
     </div>
     <div class="instSliders">
@@ -161,6 +195,15 @@
 
 <!-- ================= ADVANCED TRACK EDITOR (AUTOMATION) ================= -->
 <div id="advancedEditor" class="hidden">
+  <!-- ---- dock slots ----
+       A panel that normally floats elsewhere in the app (opened from its own toggle button) is MOVED
+       into one of these while the advanced editor is open, and moved back out to floating when it
+       closes — see registerDockPanel()/syncDockedPanels() in app.js. A slot stays .hidden until
+       something is actually docked in it, so an empty slot contributes no width and no divider line.
+         #advDockLeft  — the chord palette (#chordPanel).
+         #advDockRight — RESERVED for the custom-sample-list panel (a later addition); it is already
+                         wired, so that panel only has to call registerDockPanel with slot:"advDockRight". -->
+  <div id="advDockLeft" class="advDock hidden"></div>
   <div id="advTabs">
     <button id="advCloseBtn" title="Close advanced editor">&#10005;</button>
     <div id="advTabGrid">
@@ -179,6 +222,7 @@
       <div id="advPointLayer"></div>
     </div>
   </div>
+  <div id="advDockRight" class="advDock hidden"></div>
 </div>
 
 <div id="rollDivider"></div>
@@ -207,6 +251,46 @@
 
 <div id="dragTooltip"></div>
 <div id="toast"></div>
+
+<!-- ================= CHORD PALETTE =================
+     Lives at body level because it has two homes: as a floating dropdown under #chordMenuBtn it must
+     escape every scrolling/overflow ancestor, and when the advanced editor is open the same element is
+     re-parented into #advDockLeft. Its grids are built once and kept across those moves — only .floating
+     vs .docked changes, so nothing here has to be torn down and rebuilt when the editor toggles. -->
+<div id="chordPanel" class="hidden">
+  <div class="chordPanelHead">
+    <span class="chordPanelTitle">Chords</span>
+    <span id="chordKeyLabel"></span>
+  </div>
+  <!-- the in-key palette leads on purpose: it is the one section that answers "what can I play right
+       now", and docked into a 165px advanced editor the panel scrolls internally — so the section that
+       must survive above the fold goes first, and the long quality grid is what you scroll down to -->
+  <div class="chordSection">
+    <div class="chordSectionLabel">In Key</div>
+    <div id="chordDiatonicGrid"></div>
+  </div>
+  <div class="chordSection">
+    <div class="chordSectionLabel">Root</div>
+    <div id="chordRootGrid"></div>
+  </div>
+  <div class="chordSection">
+    <div class="chordSectionLabel">Quality</div>
+    <div id="chordQualityGrid"></div>
+  </div>
+</div>
+
+<!-- ================= CUSTOM SAMPLE MANAGER =================
+     Same two-homed arrangement as #chordPanel above, and body-level for the same reason: floating, it
+     has to escape every scrolling ancestor to hang under #sampleMenuBtn; docked, the very same element
+     is re-parented into #advDockRight. Its rows are rebuilt by renderSamplePanel() whenever the registry
+     changes, which is independent of which home it is currently in. -->
+<div id="samplePanel" class="hidden">
+  <div class="samplePanelHead">
+    <span class="samplePanelTitle">Samples</span>
+    <span id="sampleCountLabel"></span>
+  </div>
+  <div id="sampleList"></div>
+</div>
 
 <!-- ================= TRACK COLOR PICKER ================= -->
 <div id="colorPicker" class="hidden">

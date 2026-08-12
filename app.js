@@ -32,6 +32,11 @@ function rowIndexToMidi(rowIndex, totalRows){ // row 0 = top = highest pitch
    ====================================================================== */
 let state = {
   bpm:120, timeSig:[4,4], key:"C", mode:"Major", octaveFocus:4, noteLenSteps:4, projectTitle:"Bit Beats Project",
+  // uploaded audio samples belong to the PROJECT, not to whichever track happened to load them: several
+  // tracks can point at one upload, and the sample manager renames them in one place (see the CUSTOM
+  // SAMPLE REGISTRY section). Shape: [{id, name, buffer}] — `buffer` is a decoded AudioBuffer and is
+  // therefore runtime-only, never serialized.
+  samples: [],
   tracks: [], selectedTrackId:null, clipboard:[], trackClipboard:null, playing:false, playStartStep:0,
   loop:{enabled:false, start:0, end:16}, advancedTrackId:null, advancedParam:"volume",
   metronomeOn:false, holdPositionOnPause:false
@@ -50,7 +55,7 @@ let phantomSelection = null;
 // double-click-to-delete of a pre-existing note.
 let justPlacedNoteId = null, justPlacedAt = 0;
 const JUST_PLACED_WINDOW_MS = 700;
-let nextTrackId=1, nextNoteId=1;
+let nextTrackId=1, nextNoteId=1, nextSampleId=1;
 let editContext = "notes"; // "notes" or "track" — decides what Ctrl+C/Ctrl+V act on
 // throttles Ctrl+V so holding/mashing it can't fire dozens of paste-and-rerender cycles a second
 let lastPasteAt = 0;
@@ -63,8 +68,10 @@ function pasteOnCooldown(){
 }
 
 function defaultInstrument(){
+  // sampleId names an entry in state.samples; customBuffer is that entry's decoded AudioBuffer, cached
+  // on the instrument so playNote() can stay a single `inst.customBuffer` lookup on the audio path
   return { wave:"square", volume:0.8, attack:5, release:80, eqLow:0, eqMid:0, eqHigh:0, reverb:0,
-           customSampleData:null, customBaseMidi:60 };
+           customSampleData:null, customBaseMidi:60, sampleId:null };
 }
 function defaultAutomation(){
   return { volume:[], pan:[], reverb:[], eqLow:[], eqMid:[], eqHigh:[] };
@@ -73,6 +80,38 @@ function makeTrack(name, colorIdx){
   return { id: nextTrackId++, name: name||("Track "+nextTrackId), color: TRACK_COLORS[colorIdx % TRACK_COLORS.length],
            instrument: defaultInstrument(), notes: [], muted:false, solo:false, volume:0.8, pan:50, regions:null,
            automation: defaultAutomation() };
+}
+
+/* ======================================================================
+   CUSTOM SAMPLE REGISTRY
+
+   One list of uploads per project (state.samples), so a sample has a NAME that outlives the track that
+   loaded it — that name is what both waveform dropdowns and the sample manager show, and renaming it in
+   one place renames it everywhere. A track still carries its own decoded buffer on
+   instrument.customBuffer, exactly as before, so the audio path (playNote) is untouched; sampleId is
+   the back-reference that says WHICH registry entry that buffer came from.
+   ====================================================================== */
+function findSample(id){
+  if(id==null) return null;
+  return state.samples.find(s=>s.id===id) || null;
+}
+function registerSample(name, buffer){
+  const entry = {id: nextSampleId++, name: (name||"Sample").trim() || "Sample", buffer};
+  state.samples.push(entry);
+  return entry;
+}
+function applySampleToTrack(track, entry){
+  track.instrument.wave = "custom";
+  track.instrument.sampleId = entry.id;
+  track.instrument.customBuffer = entry.buffer;
+}
+// AudioBuffers are runtime objects that never survive a round trip through plain data, so every path
+// that rebuilds tracks from plain data (undo snapshots, loadProject) has to re-point customBuffer at
+// the registry entry the instrument's sampleId names. A sampleId with no entry behind it is left
+// alone rather than cleared — the project may simply have been loaded without its audio.
+function resolveTrackSample(track){
+  const s = findSample(track.instrument.sampleId);
+  if(s) track.instrument.customBuffer = s.buffer;
 }
 
 /* ======================================================================
@@ -88,6 +127,10 @@ function cloneAutomation(automation){
 function snapshotTracks(){
   return {
     selectedTrackId: state.selectedTrackId,
+    // the mode rides along because switching it now REWRITES pitches (see transposeProjectToMode):
+    // restoring the notes without restoring the mode would leave the Mode select claiming "Minor" over
+    // a project whose notes are back in Major. Every other snapshot just re-stores the same value.
+    mode: state.mode,
     tracks: state.tracks.map(t=>({
       id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan,
       instrument: Object.assign({}, t.instrument),
@@ -108,6 +151,15 @@ function beginHistoryGesture(){
 function endHistoryGesture(){ historyArmed = false; }
 function restoreSnapshot(snap){
   state.selectedTrackId = snap.selectedTrackId;
+  // put the mode (and its select, and everything keyed off the scale) back before the notes are laid
+  // out again. Older snapshots predate this field, so fall back to leaving the mode where it is.
+  if(snap.mode && snap.mode!==state.mode){
+    state.mode = snap.mode;
+    const ms = document.getElementById("modeSel");
+    if(ms) ms.value = state.mode;
+    buildPianoLabels(); drawGridLines();
+    if(typeof renderChordPalette==="function") renderChordPalette();
+  }
   state.tracks = snap.tracks.map(t=>{
     const track = { id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan??50,
       instrument: Object.assign({}, t.instrument), notes: t.notes.map(n=>({...n})),
@@ -116,6 +168,9 @@ function restoreSnapshot(snap){
     nextTrackId = Math.max(nextTrackId, track.id+1);
     track.notes.forEach(n=>{ nextNoteId = Math.max(nextNoteId, n.id+1); });
     Object.values(track.automation).forEach(pts=> pts.forEach(p=>{ nextNoteId = Math.max(nextNoteId, p.id+1); }));
+    // the registry itself is deliberately NOT snapshotted (an upload is an asset, not an edit, so undo
+    // must not un-import it) — the snapshot only carries sampleId, and this puts the buffer back
+    resolveTrackSample(track);
     buildChain(track);
     return track;
   });
@@ -463,8 +518,28 @@ function renderPlayheads(){
   // Positioned via transform, not left: a sticky element sticks whichever axis has a non-auto inset,
   // so setting `left` here would also freeze the grip horizontally once the grid scrolled underneath it.
   document.getElementById("playheadGrip").style.transform = "translateX("+x+"px)";
-  document.getElementById("trackListPlayhead").style.left = (step/stepsPerBar()*BAR_PX) +"px";
+  const trackX = step/stepsPerBar()*BAR_PX;
+  document.getElementById("trackListPlayhead").style.left = trackX+"px";
   positionTrackListFlag();
+  // Follow the playhead only while it is actually moving under playback's control. When stopped, the
+  // two scrollers belong entirely to the user — renderPlayheads() also runs on zoom, undo, edits and
+  // manual playhead drags, and yanking the view on any of those would be hostile.
+  if(state.playing){
+    centerScrollOnPlayhead(gridScroll, x);
+    centerScrollOnPlayhead(document.getElementById("trackListCol"), trackX);
+  }
+}
+// Parks `x` (a content-space pixel offset) in the middle of the scroller's viewport, clamped to the
+// real scroll range so the very start and very end of the project simply sit off-center instead of
+// being forced past the ends. scrollLeft ONLY: the arrange view mirrors scrollTop between
+// #instrumentListScroll and #trackListCol, so touching the vertical axis here would fight that sync.
+// Writing scrollLeft does fire each element's "scroll" listener, but neither one reads scrollLeft
+// (syncPianoScroll only mirrors scrollTop to the piano column), so there is no feedback loop.
+function centerScrollOnPlayhead(el, x){
+  if(!el) return;
+  const max = el.scrollWidth - el.clientWidth;
+  if(max <= 0) return; // content fits: nothing to scroll, and scrollLeft would just clamp to 0 anyway
+  el.scrollLeft = Math.max(0, Math.min(max, x - el.clientWidth/2));
 }
 
 // keeps the little playhead flag pinned to whatever row is currently scrolled to the top of the
@@ -513,6 +588,89 @@ function isInScale(midi){
   const keyIdx = NOTE_NAMES.indexOf(state.key);
   const rel = ((midi - keyIdx)%12+12)%12;
   return scaleSemitones().includes(rel);
+}
+
+/* ---------- MODE SWITCHING: transposition by scale degree ----------
+   Changing the project's mode is meant to move the MUSIC into the new mode, not just recolour which
+   rows count as in-scale. A note is therefore remapped by WHICH DEGREE OF THE SCALE it is, keeping its
+   position in the run and taking the new mode's semitone for that position: C D E F G A B C in C Major
+   becomes C D D# F G G# A# C in C Minor, because degree 2 sits 4 semitones above the root in Major and
+   3 in Minor, degree 5 at 9 vs 8, degree 6 at 11 vs 10.
+
+   Deliberately NOT nearest-pitch snapping. Every one of the twelve pitches is a real pitch, so a "snap
+   to the closest legal note" rule would leave E, A and B exactly where they are and the switch would
+   change nothing at all — the thirds, sixths and sevenths that actually define a mode are precisely the
+   notes that must move. */
+function transposePitchBetweenModes(pitch, keyIdx, fromScale, toScale){
+  // Chromatic is the one scale with 12 entries, and its positions carry no degree identity — index 11
+  // of a 12-entry list is not "the seventh" of anything. Arriving at Chromatic is therefore a no-op:
+  // every pitch already belongs to it, so nothing needs to move.
+  if(toScale.length===12) return pitch;
+  // `rel` is the note's position inside its own key-relative octave and `base` carries everything else
+  // (the octave AND the key offset), so rebuilding the pitch as base+newRel keeps each note in the very
+  // same octave it started in instead of letting it drift up or down one.
+  const rel = ((pitch - keyIdx)%12+12)%12;
+  let base = pitch - rel;
+  let out;
+  if(fromScale.length===12){
+    // Leaving Chromatic is the mirror problem: there are 12 source positions and only 7 target degrees,
+    // so index mapping would scatter the notes over more than an octave. Snap to the nearest pitch of
+    // the target scale instead. Only candidates within this same key-relative octave are considered and
+    // ties go to the LOWER one, so a snap can never bump a note into a neighbouring octave.
+    let best = toScale[0];
+    for(let i=1;i<toScale.length;i++){ if(Math.abs(toScale[i]-rel) < Math.abs(best-rel)) best = toScale[i]; }
+    out = base + best;
+  } else {
+    const idx = fromScale.indexOf(rel);
+    if(idx!==-1){
+      // the common case, and the one the user's example is about: both scales have exactly 7 degrees,
+      // so degree N of the old mode is unambiguously degree N of the new one.
+      out = base + toScale[idx];
+    } else {
+      // An accidental has no degree of its own, so it borrows one: anchor it to the nearest degree AT
+      // OR BELOW it and carry its chromatic offset across unchanged. Chosen over rounding to the
+      // nearest degree because it keeps a chromatic passing tone sitting just above the same scale
+      // tone it was leaning on before the switch. Degree 0 is always semitone 0, so an anchor always
+      // exists for any rel that is not itself a degree.
+      let anchor = 0;
+      for(let i=0;i<fromScale.length;i++){ if(fromScale[i] < rel) anchor = i; }
+      let newRel = toScale[anchor] + (rel - fromScale[anchor]);
+      // re-normalise: an offset carried onto a degree that sits higher in the new mode can push past
+      // the top of the octave, in which case it folds into `base` rather than being left out of range
+      if(newRel > 11){ newRel -= 12; base += 12; }
+      out = base + newRel;
+    }
+  }
+  // that fold (and a downward snap out of Chromatic in a non-C key) is the only way this can leave the
+  // pitch range the grid can actually draw, so clamp it the same way importMidiTracks does
+  return Math.max(TOP_MIDI-TOTAL_ROWS+1, Math.min(TOP_MIDI, out));
+}
+// Sweeps every note of every track — mode is a PROJECT setting, so the switch applies to the whole
+// project, not just the selected track. Returns how many NOTES were touched (a note whose slur target
+// moved counts once, like the single tile it draws as), so the caller can tell a switch worth an undo
+// checkpoint from one that changed nothing (Major→Lydian only ever touches degree 3, so a part that
+// never plays it comes out identical).
+function transposeProjectToMode(fromMode, toMode){
+  const fromScale = SCALES[fromMode] || SCALES.Major;
+  const toScale = SCALES[toMode] || SCALES.Major;
+  const keyIdx = Math.max(0, NOTE_NAMES.indexOf(state.key));
+  let moved = 0;
+  state.tracks.forEach(track=>{
+    track.notes.forEach(n=>{
+      let touched = false;
+      const p = transposePitchBetweenModes(n.pitch, keyIdx, fromScale, toScale);
+      if(p!==n.pitch){ n.pitch = p; touched = true; }
+      // a slur target is a real pitch drawn on the grid (renderNotes places the stub at
+      // midiToRow(bendTo)), so it has to travel by the same rule — otherwise the note would land in the
+      // new mode while the pitch it slides into stayed behind in the old one
+      if(n.bendTo!=null){
+        const b = transposePitchBetweenModes(n.bendTo, keyIdx, fromScale, toScale);
+        if(b!==n.bendTo){ n.bendTo = b; touched = true; }
+      }
+      if(touched) moved++;
+    });
+  });
+  return moved;
 }
 
 function buildPianoLabels(){
@@ -679,9 +837,30 @@ function clampedBendEndStep(note){
   return Math.max(min, Math.min(max, raw));
 }
 
+// The Note Length dropdown doubles as a property editor for the selection (see its change handler), so
+// it has to READ as one too: with notes selected it shows their length, and with nothing selected it
+// falls back to the length the next placed note will get. Driven from renderNotes() because that is
+// what every selection change already goes through.
+function syncNoteLenSelToSelection(){
+  const sel = document.getElementById("noteLenSel"); if(!sel) return;
+  const track = selectedTrack();
+  if(track && selectedNoteIds.size){
+    const durs = track.notes.filter(n=>selectedNoteIds.has(n.id)).map(n=>n.dur);
+    if(!durs.length) return;
+    // mixed lengths — or a dragged-out length like 3 steps that no option represents — leave the
+    // dropdown exactly as it is, rather than blanking it out with a value it has no <option> for
+    if(durs.every(d=>d===durs[0]) && Array.prototype.some.call(sel.options, o=>Number(o.value)===durs[0])){
+      sel.value = String(durs[0]);
+    }
+    return;
+  }
+  sel.value = String(state.noteLenSteps);
+}
+
 function renderNotes(){
   noteLayer.innerHTML="";
   selectedNoteIds.forEach(id=>{ if(!selectedTrack() || !selectedTrack().notes.some(n=>n.id===id)) selectedNoteIds.delete(id); });
+  syncNoteLenSelToSelection();
   const track = selectedTrack();
   if(!track) return;
   track.notes.forEach(note=>{
@@ -784,13 +963,13 @@ function renderNotes(){
 let BAR_PX = 60; // track-list horizontal zoom — pixels per bar (independent of vertical row shrink)
 let TRACK_ROW_H = 46; // shared instrument-row / track-row height — independent of BAR_PX (vertical vs horizontal zoom)
 const TRACK_ROW_MIN = 34, TRACK_ROW_MAX = 90;
-// Row shrink is graduated rather than a single binary "compact" flip:
-//   H >= TRACK_ROW_PATTERN_MIN : full card — name header, controls row beneath it, note-pattern preview
-//   TRACK_ROW_COMPACT_MAX < H  : same two-row layout, but no room left for the pattern preview
+// Row shrink is a single threshold on the row's height:
+//   H >  TRACK_ROW_COMPACT_MAX : full card — name header with the controls row beneath it
 //   H <= TRACK_ROW_COMPACT_MAX : single line — controls move to the RIGHT of the name (never hidden);
 //                                the name truncates and the waveform select abbreviates to make room
+// Instrument rows carry no note preview at any height — the note pattern lives only in the track
+// list's own preview blocks (renderTrackBlock) and the advanced editor's lane.
 const TRACK_ROW_COMPACT_MAX = 45;
-const TRACK_ROW_PATTERN_MIN = 54;
 const TRACK_ROW_HDR_H = 22; // instrument-row name strip's height on full-size rows
 // track-preview blocks: inset from their row's top/bottom, with an opaque colored header strip
 // (mirroring #advLaneHeader) over a translucent body
@@ -804,9 +983,22 @@ function setTrackRowHeight(h){
   TRACK_ROW_H = Math.max(TRACK_ROW_MIN, Math.min(TRACK_ROW_MAX, Math.round(h)));
   renderInstrumentList();
 }
+// zoom the track list horizontally — the arrange-view counterpart of setZoom(), driven by either the
+// #trackZoomSlider or the same ctrl+wheel / trackpad-pinch gesture the piano roll uses
 function setTrackZoom(px){
-  BAR_PX = Math.max(BAR_PX_MIN, Math.min(BAR_PX_MAX, Math.round(px)));
+  const next = Math.max(BAR_PX_MIN, Math.min(BAR_PX_MAX, Math.round(px)));
+  // a pinch gesture fires dozens of wheel events per second, most of which round to the same integer —
+  // bailing here keeps those from each rebuilding the whole track list for no visible change
+  if(next===BAR_PX) return;
+  BAR_PX = next;
   buildTrackList();
+  // the automation lane is measured in BAR_PX too (its width, its curve and its draggable dots all come
+  // off stepToX), so it has to be redrawn with the track list or it keeps painting the previous zoom
+  // until something else happens to refresh it. Cheap when closed — renderAdvancedEditor bails at once.
+  renderAdvancedEditor();
+  // keep the slider showing the zoom the wheel gesture just landed on, mirroring setZoom/#zoomSlider
+  const ts = document.getElementById("trackZoomSlider");
+  if(ts) ts.value = BAR_PX;
 }
 
 // translucent variant of a track color for the row body (the opaque header keeps the raw color)
@@ -827,7 +1019,6 @@ function renderInstrumentList(){
   const keepScrollTop = scroller ? scroller.scrollTop : 0;
   list.innerHTML="";
   const oneline = TRACK_ROW_H<=TRACK_ROW_COMPACT_MAX;
-  const showPattern = TRACK_ROW_H>=TRACK_ROW_PATTERN_MIN;
   const hdrH = oneline ? TRACK_ROW_H-1 : TRACK_ROW_HDR_H;
   state.tracks.forEach(track=>{
     const row = document.createElement("div");
@@ -838,7 +1029,6 @@ function renderInstrumentList(){
     // the name is plain text until double-clicked (see the dblclick handler on #instrumentList),
     // which swaps in a bordered <input> for the duration of the edit
     row.innerHTML = `
-      <canvas class="instrumentRowPattern"></canvas>
       <div class="tname"><span class="swatch" style="background:${track.color}"></span>
         <span class="nameText" data-role="nameText" title="Double-click to rename">${escapeHtml(track.name)}</span></div>
       <div class="tctrls">
@@ -848,15 +1038,14 @@ function renderInstrumentList(){
           <option value="square">Square</option><option value="pulse25">Pulse25</option>
           <option value="pulse12">Pulse12</option><option value="triangle">Triangle</option>
           <option value="sawtooth">Saw</option><option value="sine">Sine</option>
-          <option value="noise">Noise</option><option value="custom">Custom</option>
+          <option value="noise">Noise</option>
         </select>
         <input type="range" data-role="vol" min="0" max="100" value="${Math.round(track.volume*100)}">
       </div>`;
-    row.querySelector('[data-role=wave]').value = track.instrument.wave;
-    const pattern = row.querySelector(".instrumentRowPattern");
-    if(!showPattern) pattern.remove();
+    // the sample options are appended (and the value set) here rather than baked into the template
+    // string above, because they are project state, not markup — see syncWaveCustomOptions
+    syncWaveCustomOptions(row.querySelector('[data-role=wave]'), track.instrument, "Custom");
     list.appendChild(row);
-    if(showPattern) drawInstrumentRowPattern(track, pattern);
   });
   // second pass, after the rows are in the document and have a measurable layout
   list.querySelectorAll(".instrumentRow").forEach(row=>{
@@ -912,6 +1101,81 @@ function sizeNameInput(el){
   if(el.tagName==="INPUT") el.style.width = natural+"px";
 }
 
+/* ---------- waveform <select>: the "custom" end of the option list ----------
+   Once the project has uploads, the single generic "Custom" entry is replaced by ONE OPTION PER SAMPLE,
+   labelled with that sample's name — so choosing an instrument and choosing which sample are the same
+   gesture. Values are "custom:<id>", which can't collide with the seven fixed wave values nor with the
+   bare "custom" that still means "this instrument is a sample" when no registry entry backs it.
+
+   Labels are fitted to the select's own rendered width and then written into option.dataset.full. That
+   is the handshake with applyWaveTier() below: it treats data-full as an option's TRUE label, so tier 0
+   restores this already-shortened name (not the raw filename, which would overflow the row) and tier 1
+   takes its first letter. */
+const WAVE_SEL_ARROW_PX = 20; // room the native dropdown arrow claims beside an option's text
+function fitSampleLabel(name, sel){
+  const cs = getComputedStyle(sel);
+  const font = cs.fontStyle+" "+cs.fontWeight+" "+cs.fontSize+" "+cs.fontFamily;
+  const budget = (sel.clientWidth||0) - (parseFloat(cs.paddingLeft)||0) - (parseFloat(cs.paddingRight)||0)
+               - WAVE_SEL_ARROW_PX;
+  if(budget<=0 || measureTextPx(name, font)<=budget) return name;
+  // drop characters until the name PLUS its ellipsis fits — the "…" is part of what has to fit, so it
+  // is measured with the candidate rather than tacked on after the budget was already spent
+  let cut = name.length;
+  while(cut>1 && measureTextPx(name.slice(0,cut)+"…", font) > budget) cut--;
+  return name.slice(0,cut)+"…";
+}
+function refreshWaveSampleLabels(sel){
+  if(!sel) return;
+  // measure against the select's UNABBREVIATED width: applyWaveTier's narrow tiers squeeze the box down
+  // to 34/22px, and fitting names to that would bake a temporary squeeze into the stored labels
+  sel.classList.remove("wtier1","wtier2");
+  Array.prototype.forEach.call(sel.options, o=>{
+    const s = findSample(Number(o.dataset.sample));
+    if(!s) return; // fixed waves and the generic "custom" fallback keep their authored labels
+    const label = fitSampleLabel(s.name, sel);
+    o.dataset.full = label;
+    o.textContent = label;
+  });
+}
+function waveSelValue(inst){
+  if(inst.wave!=="custom") return inst.wave;
+  return findSample(inst.sampleId) ? "custom:"+inst.sampleId : "custom";
+}
+function syncWaveCustomOptions(sel, inst, genericLabel){
+  if(!sel) return;
+  Array.prototype.slice.call(sel.querySelectorAll("option[data-sample]")).forEach(o=>o.remove());
+  const resolved = inst ? findSample(inst.sampleId) : null;
+  // the plain option survives exactly two cases: a project with no uploads at all (so a fresh project
+  // reads exactly as it always did), and a track whose wave is "custom" with nothing in the registry
+  // behind it — save files carry no audio data, so a reloaded project lands there, and without this
+  // fallback its select would render blank
+  if(!state.samples.length || (inst && inst.wave==="custom" && !resolved)){
+    const o = document.createElement("option");
+    o.value = "custom"; o.textContent = genericLabel; o.dataset.sample = "generic";
+    sel.appendChild(o);
+  }
+  state.samples.forEach(s=>{
+    const o = document.createElement("option");
+    o.value = "custom:"+s.id; o.dataset.sample = String(s.id); o.textContent = s.name;
+    sel.appendChild(o);
+  });
+  refreshWaveSampleLabels(sel);
+  if(inst) sel.value = waveSelValue(inst);
+}
+// translates a waveform <select>'s value back onto the instrument. Binding the registry entry's buffer
+// to instrument.customBuffer here is what keeps playNote()'s `wave==="custom" && customBuffer` branch
+// working unchanged — the audio path never learns that a registry exists.
+function applyWaveSelection(inst, value){
+  const m = /^custom:(\d+)$/.exec(value);
+  if(m){
+    const s = findSample(Number(m[1]));
+    inst.wave = "custom";
+    if(s){ inst.sampleId = s.id; inst.customBuffer = s.buffer; }
+    return;
+  }
+  inst.wave = value;
+}
+
 /* ---------- waveform <select> progressive abbreviation ----------
    Tier 0 = full word ("Square"), 1 = first letter only ("S"), 2 = no text at all (bare dropdown arrow).
    A plain <select> renders whatever text the *selected* <option> holds, so abbreviating means
@@ -938,6 +1202,10 @@ function fitRowControls(row){
   const sel = ctrls && ctrls.querySelector('select[data-role=wave]');
   const vol = ctrls && ctrls.querySelector('input[data-role=vol]');
   if(!ctrls || !name || !sel) return;
+  // sample labels are width-derived, and this is the one function every path that changes a row's width
+  // already goes through (rebuild, instrument-column resize, select focusout) — so re-fit them here,
+  // before the tier loop below starts rewriting the selected option's text
+  refreshWaveSampleLabels(sel);
   if(!row.classList.contains("oneline")){
     sel.dataset.wtier = "0"; applyWaveTier(sel, 0);
     if(vol) vol.classList.remove("volNarrow");
@@ -959,45 +1227,55 @@ function fitRowControls(row){
   if(tier===2 && vol && nameNeed + ctrls.offsetWidth > avail) vol.classList.add("volNarrow");
 }
 
-// mini note-pattern preview painted behind an instrument-list row's own controls, echoing the ghost note
-// tiles drawn in the advanced track editor (renderAdvancedEditor) and the track list's blocks
-// (renderTrackBlock) — scaled to the row's own measured size rather than a fixed lane/block width
-function drawInstrumentRowPattern(track, canvas){
-  if(!canvas) return;
-  // measure the row (canvas's positioned container), not the canvas itself — an absolutely positioned
-  // replaced element with auto width/height falls back to its own intrinsic (bitmap) size instead of
-  // the stretched CSS size, so reading canvas.clientWidth here would create a runaway feedback loop
-  // where each redraw re-derives its target size from the previous draw's bitmap size
-  const row = canvas.parentElement;
-  const w = row ? row.clientWidth : canvas.clientWidth, h = row ? row.clientHeight : canvas.clientHeight;
-  const dpr = window.devicePixelRatio||1;
-  canvas.width = Math.max(1,Math.round(w*dpr)); canvas.height = Math.max(1,Math.round(h*dpr));
-  canvas.style.width = w+"px"; canvas.style.height = h+"px";
-  const ctx = canvas.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.clearRect(0,0,w,h);
-  if(!track.notes.length || w<=0 || h<=0) return;
-  const pitches = track.notes.map(n=>n.pitch);
-  const minP = Math.min(...pitches), maxP = Math.max(...pitches);
-  const range = Math.max(1, maxP-minP);
-  const padV = 3, padH = 4;
-  const tileH = Math.min(8, Math.max(2, (h-padV*2)/(range+2)));
-  const travel = Math.max(2, h-padV*2-tileH);
-  const totalSteps = Math.max(1, STEPS_TOTAL);
-  // instrument rows are plain/dark again (the track-colored treatment moved to the track-preview
-  // blocks), so the pattern reads best as the track's own color rather than the dark tile used
-  // against a color-washed background
-  ctx.fillStyle = colorWithAlpha(track.color, 0.5);
-  ctx.globalAlpha = 0.85;
-  track.notes.forEach(n=>{
-    const nx = padH + (n.step/totalSteps)*(w-padH*2);
-    const nw = Math.max(1, (n.dur/totalSteps)*(w-padH*2));
-    const t = (n.pitch-minP)/range;
-    const centerY = (h-padV-tileH/2) - t*travel;
-    ctx.beginPath();
-    if(ctx.roundRect) ctx.roundRect(nx, centerY-tileH/2, nw, tileH, 1); else ctx.rect(nx, centerY-tileH/2, nw, tileH);
-    ctx.fill();
+/* ---------- instrument-editor top row: progressive label truncation ----------
+   Same measure-and-shrink idea as fitRowControls above, applied to the two buttons in .instTopRow,
+   because #instEditor's width is drag-resizable (see makeResizer on #vResizerInstEditor) and the row
+   has nowhere to wrap to. The full word lives in data-full and every pass restarts from it, which is
+   what makes widening the panel back out restore the whole label AND drop the ellipsis — the "…" is
+   never decoration, it appears only on a label that actually had to give up characters. */
+const INST_LABEL_MIN_CHARS = 1; // floor: one character plus the ellipsis ("A…") — never shorter, never hidden
+// a button's box is its fixed chrome (padding + border) plus the measured label, so a candidate label's
+// width can be computed without laying it out first
+function instBtnWidthFor(btn, text){
+  const cs = getComputedStyle(btn);
+  const chrome = (parseFloat(cs.paddingLeft)||0) + (parseFloat(cs.paddingRight)||0)
+               + (parseFloat(cs.borderLeftWidth)||0) + (parseFloat(cs.borderRightWidth)||0);
+  const w = measureTextPx(text, cs.fontStyle+" "+cs.fontWeight+" "+cs.fontSize+" "+cs.fontFamily);
+  return Math.ceil(w + chrome) + 1;
+}
+function fitInstTopRow(){
+  const row = document.querySelector("#instEditor .instTopRow");
+  if(!row) return;
+  // #sampleMenuBtn only exists in the row once the project has an upload, and it carries a real word
+  // like the other two, so it joins the same shrink set — a hidden one is filtered out because
+  // display:none takes it out of row.scrollWidth entirely, and shrinking it would burn passes for
+  // nothing (it is re-fitted the moment it appears, via refreshInstrumentEditor -> updateSampleMenuBtn)
+  const btns = ["advToggleBtn","uploadSampleBtn","sampleMenuBtn"].map(id=>document.getElementById(id))
+    .filter(b=>b && !b.classList.contains("hidden"));
+  if(!btns.length || !row.clientWidth) return;
+  row.classList.remove("squeezed");
+  btns.forEach(b=>{
+    if(b.dataset.full===undefined) b.dataset.full = (b.textContent||"").trim();
+    b.textContent = b.dataset.full;
+    b.style.width = instBtnWidthFor(b, b.dataset.full)+"px";
   });
-  ctx.globalAlpha = 1;
+  // chop one character off whichever label still has the most left to give, so the two shrink in step
+  // instead of the first one collapsing to "A…" while the second is still showing its full word
+  let guard = 64, atFloor = false;
+  while(row.scrollWidth > row.clientWidth && guard-- > 0){
+    let victim = null, victimLen = INST_LABEL_MIN_CHARS;
+    btns.forEach(b=>{
+      const cur = b.textContent.replace(/…$/,"");
+      if(cur.length > victimLen){ victim = b; victimLen = cur.length; }
+    });
+    if(!victim){ atFloor = true; break; } // every label is already down to its floor
+    const next = victim.textContent.replace(/…$/,"").slice(0, victimLen-1) + "…";
+    victim.textContent = next;
+    victim.style.width = instBtnWidthFor(victim, next)+"px";
+  }
+  // both labels are at "A…" and the row STILL doesn't fit — hand the shortfall to the Track / Waveform
+  // fields (see .instTopRow.squeezed) so the buttons stay on screen instead of being clipped off the end
+  row.classList.toggle("squeezed", atFloor);
 }
 
 function buildTrackList(){
@@ -1009,7 +1287,6 @@ function buildTrackList(){
   const ruler = document.createElement("div"); ruler.id="trackListRuler"; inner.appendChild(ruler);
   const ph = document.createElement("div"); ph.id="trackListPlayhead"; inner.appendChild(ph);
   const flag = document.createElement("div"); flag.id="trackListPlayheadFlag"; inner.appendChild(flag);
-  const showPattern = TRACK_ROW_H>=TRACK_ROW_PATTERN_MIN;
   state.tracks.forEach(track=>{
     const row = document.createElement("div");
     row.className="trackRow"; row.style.setProperty("--barpx",BAR_PX+"px");
@@ -1029,10 +1306,6 @@ function buildTrackList(){
       renderTrackBlock(row, track, startBar, endBar, track.notes, null);
     }
     inner.appendChild(row);
-    if(showPattern){
-      const listRow = document.querySelector('.instrumentRow[data-id="'+track.id+'"]');
-      if(listRow) drawInstrumentRowPattern(track, listRow.querySelector(".instrumentRowPattern"));
-    }
   });
   const totalW = (STEPS_TOTAL/stepsPerBar()*BAR_PX+40);
   inner.style.width = totalW+"px";
@@ -1094,20 +1367,10 @@ function renderTrackBlock(row, track, startStep, endStep, notes, regionId){
   }
   block.appendChild(pattern);
 
-  // edge grips so the block's span can be trimmed from either side, mirroring the note tile's
-  // left/right resize handles — for a track with no regions yet, grabbing an edge lazily turns its
-  // auto-computed span into a real (single) region the same way "Split at Playhead" does
-  const leftGrip = document.createElement("div");
-  leftGrip.className = "blockHandle blockHandleL";
-  leftGrip.dataset.trackId = track.id;
-  if(regionId!=null) leftGrip.dataset.regionId = regionId;
-  block.appendChild(leftGrip);
-  const rightGrip = document.createElement("div");
-  rightGrip.className = "blockHandle blockHandleR";
-  rightGrip.dataset.trackId = track.id;
-  if(regionId!=null) rightGrip.dataset.regionId = regionId;
-  block.appendChild(rightGrip);
-
+  // Deliberately no edge grips: a block's span is not directly resizable. Its length is derived from
+  // the notes it contains (or from its region's bounds), and the way to make a block read longer or
+  // shorter on screen is the track-zoom slider / pinch gesture, not dragging its edges. The whole
+  // block surface is therefore a single drag target for MOVING it sideways.
   row.appendChild(block);
 }
 
@@ -1165,8 +1428,13 @@ function advTrack(){ return state.tracks.find(t=>t.id===state.advancedTrackId); 
 function renderAdvancedEditor(){
   const panel = document.getElementById("advancedEditor");
   const track = advTrack();
-  if(!track){ panel.classList.add("hidden"); return; }
+  // both branches re-place the dock panels, because opening/closing this editor is exactly what decides
+  // whether a registered panel floats or docks. It has to happen BEFORE the lane is measured below: a
+  // panel docking into #advDockLeft takes width away from #advLaneScroll, and the canvas is sized from
+  // that element's live clientWidth/clientHeight.
+  if(!track){ panel.classList.add("hidden"); syncDockedPanels(); return; }
   panel.classList.remove("hidden");
+  syncDockedPanels();
 
   document.querySelectorAll(".advTabBtn").forEach(b=> b.classList.toggle("active", b.dataset.param===state.advancedParam));
 
@@ -1202,8 +1470,8 @@ function renderAdvancedEditor(){
   const stepToX = s=> s/spb*BAR_PX;
 
   // ghost note tiles from the track's own notes, positioned by step/duration and pitch —
-  // same idea as the mini note-pattern drawn inside the track list's blocks,
-  // just scaled to fill the full lane so you can see notes against the automation curve
+  // same idea as the mini note-pattern drawn inside the track list's blocks, so you can read the
+  // notes against the automation curve
   if(track.notes.length){
     const pitches = track.notes.map(n=>n.pitch);
     const minP = Math.min(...pitches), maxP = Math.max(...pitches);
@@ -1211,18 +1479,32 @@ function renderAdvancedEditor(){
     const tileH = Math.min(16, Math.max(6, ADV_LANE_H/(range+4)));
     const padV = 8; // keeps tiles off the lane's own top/bottom edge, independent of the card's own outer inset
     const travel = Math.max(4, ADV_LANE_H - padV*2 - tileH);
-    // Horizontal padding is applied as a real SCALE, not a flat offset: the lane's full x range is
-    // squeezed into [PAD_H, laneW-PAD_H], so tiles near the very start and the very end both keep the
-    // same breathing room instead of a late tile being shoved past the right edge and clamped/squashed.
-    // The curve and its drag-points keep the unscaled stepToX space, so interaction is untouched.
-    const PAD_H = 6;
-    const innerW = Math.max(1, laneW - PAD_H*2);
-    const scaleX = innerW/Math.max(1, laneW);
-    const tileX = s=> PAD_H + stepToX(s)*scaleX;
+    // The tiles get their OWN horizontal space rather than inheriting the timeline's: the track's note
+    // span (earliest start → latest end) is stretched across the lane, inset on both sides, so the
+    // pattern fills the rectangle comfortably no matter what BAR_PX is or how far into the project the
+    // notes actually sit. Durations stay proportional within that mapping, so a note twice as long
+    // still draws twice as wide.
+    // Fitted to the VISIBLE rectangle, not the full canvas: laneW carries the lane's scrollable width
+    // (STEPS_TOTAL at the current zoom, plus 40px of trailing breathing room), which is routinely wider
+    // than the scroll viewport — mapping across it would park the tail of the pattern just off the right
+    // edge, which is exactly the "doesn't fit in the rectangle" this mapping exists to fix. The whole
+    // preview therefore reads at a glance with no horizontal scrolling.
+    // The curve and its draggable dots deliberately stay in the real, unscaled stepToX space: the
+    // advPointLayer drag handlers convert pixels back to steps via BAR_PX, so rescaling them here
+    // would silently break that math. Only these decorative tiles are remapped.
+    const INSET_H = 10;
+    const fitW = Math.min(laneW, scrollEl.clientWidth || laneW);
+    const innerW = Math.max(1, fitW - INSET_H*2);
+    const spanStart = Math.min(...track.notes.map(n=>n.step));
+    const spanEnd = Math.max(...track.notes.map(n=>n.step+n.dur));
+    // a lone note (or any zero-width span) would otherwise divide by zero — one step is the smallest
+    // span that still maps to a real width, and the per-tile Math.max(2,…) below keeps it visible
+    const span = Math.max(1, spanEnd-spanStart);
+    const tileX = s=> INSET_H + (s-spanStart)/span*innerW;
     ctx.fillStyle = "rgba(216,255,230,.55)"; // near-white mint green, echoing the accent color
     track.notes.forEach(n=>{
-      const nx = Math.max(PAD_H, Math.min(tileX(n.step), laneW-PAD_H-2));
-      const nw = Math.max(2, Math.min(tileX(n.step+n.dur)-tileX(n.step)-1, laneW-PAD_H-nx));
+      const nx = tileX(n.step);
+      const nw = Math.max(2, tileX(n.step+n.dur)-nx-1);
       const t = (n.pitch-minP)/range;
       const centerY = (ADV_LANE_H-padV-tileH/2) - t*travel;
       ctx.beginPath();
@@ -1321,12 +1603,15 @@ function refreshInstrumentEditor(){
   const track = selectedTrack();
   const editor = document.getElementById("instEditor");
   const advBtn = document.getElementById("advToggleBtn");
-  if(!track){ editor.style.opacity=.4; editor.style.pointerEvents="none"; advBtn.classList.remove("on"); return; }
+  // before the early return: the sample-manager button's presence depends on the REGISTRY, not on
+  // which track (if any) happens to be selected, and .instTopRow's fit has to account for it either way
+  updateSampleMenuBtn();
+  if(!track){ editor.style.opacity=.4; editor.style.pointerEvents="none"; advBtn.classList.remove("on"); fitInstTopRow(); return; }
   editor.style.opacity=1; editor.style.pointerEvents="auto";
   document.getElementById("instTrackName").textContent = track.name;
   advBtn.classList.toggle("on", state.advancedTrackId===track.id);
   const inst = track.instrument;
-  document.getElementById("waveSel").value = inst.wave;
+  syncWaveCustomOptions(document.getElementById("waveSel"), inst, "Custom Sample");
   document.getElementById("volSlider").value = Math.round((track.volume)*100);
   document.getElementById("volVal").textContent = Math.round(track.volume*100);
   document.getElementById("atkSlider").value = inst.attack; document.getElementById("atkVal").textContent = inst.attack+"ms";
@@ -1335,7 +1620,16 @@ function refreshInstrumentEditor(){
   document.getElementById("eqMidSlider").value = inst.eqMid; document.getElementById("eqMidVal").textContent = inst.eqMid+"dB";
   document.getElementById("eqHighSlider").value = inst.eqHigh; document.getElementById("eqHighVal").textContent = inst.eqHigh+"dB";
   document.getElementById("revSlider").value = inst.reverb; document.getElementById("revVal").textContent = inst.reverb+"%";
-  document.getElementById("sampleName").textContent = inst.customBuffer ? "sample loaded" : "";
+  // the sample's name now rides in the waveform dropdown itself, so this span has nothing left to add
+  // in the normal case and stays empty (which also stops it competing with the buttons for row width).
+  // It only speaks up where the dropdown genuinely can't: a track set to "custom" that the registry
+  // can't name — a project reloaded from JSON, which never carries the audio itself.
+  const named = findSample(inst.sampleId);
+  document.getElementById("sampleName").textContent =
+    (inst.wave==="custom" && !named) ? (inst.customBuffer ? "sample loaded" : "no sample") : "";
+  // the track name just changed width, which changes how much of the top row is left for the
+  // buttons beside it — re-fit their labels against the row as it now measures
+  fitInstTopRow();
 }
 
 /* ======================================================================
@@ -1437,8 +1731,36 @@ let drag = null; // {mode:'select'|'move'|'place', startX,startY, origin notes..
 let playheadDrag = null; // {type:'grid'|'trackList'}
 let loopDrag = null; // {mode:'move'|'resizeL'|'resizeR', ...}
 let trackDrag = null; // {trackId, startX, origin}
-let blockResizeDrag = null; // {trackId, regionId, edge:'left'|'right', minBound, maxBound}
 let suppressTrackListClick = false;
+
+// true only while the current note selection is the one PLACEMENT itself just made — see the
+// empty-cell branch of onGridMouseDown, which has to keep placing notes on consecutive clicks now
+// that placing one selects it
+let selectionFromPlacement = false;
+
+/* ---------- selecting a note tile is exclusive across the whole app ----------
+   Region blocks in the track list, automation dots in the advanced editor, the phantom keyboard cursor
+   and a focused button/dropdown/slider all answer the same question — "what does the next keypress act
+   on?" — so exactly one of them may be lit at a time, and a note tile winning clears the rest.
+   Each panel is only re-rendered when its own selection actually had something in it, so the common
+   case (clicking tile after tile with nothing else selected) stays a plain renderNotes(). */
+function clearNonNoteSelections(){
+  if(selectedRegionIds.size){ selectedRegionIds.clear(); buildTrackList(); }
+  if(selectedAutoPointIds.size){ selectedAutoPointIds.clear(); renderAdvancedEditor(); }
+  // the phantom cell is already mutually exclusive with selectedNoteIds; clearing it here is what
+  // makes that invariant hold for every selection path rather than only the ones that remembered to
+  phantomSelection = null;
+  selectionFromPlacement = false;
+  blurFocusedControl();
+}
+// replaces the note selection with exactly `ids` and nothing else, anywhere in the app. Callers that
+// ADD to the existing selection (shift-click, rubber band) set selectedNoteIds themselves and call
+// clearNonNoteSelections() instead. Neither renders the notes — every caller already does.
+function selectNotesExclusively(ids, fromPlacement){
+  selectedNoteIds = new Set(ids);
+  clearNonNoteSelections();
+  selectionFromPlacement = !!fromPlacement;
+}
 
 function xyToStepRow(clientX, clientY){
   const rect = gridInner.getBoundingClientRect();
@@ -1596,7 +1918,9 @@ function onGridMouseDown(e){
   const hitNote = track.notes.find(n=> row===midiToRow(n.pitch) && step>=n.step && step<n.step+n.dur);
   if(hitNote){
     if(e.detail>=2){ e.preventDefault(); return; } // double-click: let the dblclick handler delete it
-    phantomSelection = null;
+    // a tile winning the selection clears every other kind of selection in the app (regions,
+    // automation dots, the phantom cell) and drops focus off whatever control was last clicked
+    clearNonNoteSelections();
     // slurred tiles preview the slide itself (base pitch sliding into the target) rather than just
     // the base pitch alone, compressed into the same short preview length
     if(!state.playing) previewNote(track, hitNote.pitch, hitNote.bendTo);
@@ -1616,8 +1940,10 @@ function onGridMouseDown(e){
 
   // empty cell with an existing selection: the first click just clears it, matching how clicking empty
   // space deselects elsewhere — placing a new note is a deliberate second click, not a side effect of
-  // dismissing whatever was highlighted
-  if(selectedNoteIds.size){
+  // dismissing whatever was highlighted.
+  // The exception is a selection that placement itself just made: now that placing a tile selects it,
+  // letting that selection swallow the next click would turn note entry into two clicks per note.
+  if(selectedNoteIds.size && !selectionFromPlacement){
     selectedNoteIds.clear();
     renderNotes();
     e.preventDefault();
@@ -1650,22 +1976,6 @@ window.addEventListener("mousemove", (e)=>{
         p.value = Math.max(0, Math.min(100, o.value+dValue));
       });
       renderAdvancedEditor();
-    }
-    return;
-  }
-  if(blockResizeDrag){
-    const track = state.tracks.find(t=>t.id===blockResizeDrag.trackId);
-    const region = track && track.regions && track.regions.find(r=>r.id===blockResizeDrag.regionId);
-    if(region){
-      const rect = document.getElementById("trackListInner").getBoundingClientRect();
-      const spb = stepsPerBar();
-      const stepAt = Math.round((e.clientX-rect.left)/BAR_PX*spb);
-      if(blockResizeDrag.edge==="left"){
-        region.start = Math.max(blockResizeDrag.minBound, Math.min(region.end-1, stepAt));
-      } else {
-        region.end = Math.min(blockResizeDrag.maxBound, Math.max(region.start+1, stepAt));
-      }
-      buildTrackList();
     }
     return;
   }
@@ -1736,6 +2046,9 @@ window.addEventListener("mousemove", (e)=>{
       const r = midiToRow(n.pitch);
       if(n.step+n.dur>s0 && n.step<s1 && r>=r0 && r<r1) selectedNoteIds.add(n.id);
     });
+    // the band sweeping over its first tile makes notes the selection, so everything else deselects —
+    // the helper's own guards keep this from rebuilding anything on the frames after that first one
+    if(selectedNoteIds.size) clearNonNoteSelections();
     renderNotes();
   } else if(drag.mode==="move"){
     const dStep = step-drag.startStep, dRow = row-drag.startMidiRow;
@@ -1778,6 +2091,9 @@ window.addEventListener("mousemove", (e)=>{
         const newNote = {id:drag.noteId, step:drag.startStep, pitch:drag.pitch, dur, bendTo:null};
         track.notes.push(newNote);
         extendRegionsForNote(track, newNote);
+        // a placed tile IS the selection, so the length can be retyped or the tile nudged straight
+        // away — same for the drag-a-custom-length path as for a plain click (see the mouseup branch)
+        selectNotesExclusively([newNote.id], true);
         previewNote(track, drag.pitch);
       } else {
         const n = track.notes.find(nn=>nn.id===drag.noteId);
@@ -1883,7 +2199,6 @@ window.addEventListener("mousemove", (e)=>{
 window.addEventListener("mouseup", ()=>{
   endHistoryGesture();
   if(autoDrag){ autoDrag=null; return; }
-  if(blockResizeDrag){ blockResizeDrag=null; recomputeStepsTotal(); return; }
   if(loopDrag){ loopDrag=null; return; }
   if(trackDrag){ trackDrag=null; document.body.style.cursor=""; recomputeStepsTotal(); return; }
   if(playheadDrag){
@@ -1903,6 +2218,9 @@ window.addEventListener("mouseup", ()=>{
           track.notes.push(newNote);
           extendRegionsForNote(track, newNote);
           justPlacedNoteId = newNote.id; justPlacedAt = performance.now();
+          // the note the user just placed becomes the selection (and clears every other one), so its
+          // type can be changed from the Note Length dropdown without hunting for it again
+          selectNotesExclusively([newNote.id], true);
           if(!state.playing) previewNote(track, drag.pitch);
           renderNotes();
         }
@@ -1915,11 +2233,44 @@ window.addEventListener("mouseup", ()=>{
   drag=null; hideTooltip();
 });
 
-// range sliders (volume/EQ/etc.) shouldn't keep keyboard focus after the drag ends —
-// otherwise stray Delete/Backspace/arrow presses get eaten by the slider instead of the note editor
+/* ---------- no sticky focus on ANY button, dropdown or slider ----------
+   A control that keeps focus after being clicked is wrong twice over: it LOOKS selected (the focus ring
+   is indistinguishable from persistent on/off state), and it BEHAVES selected — stray Delete/Backspace/
+   arrow presses get eaten by the control instead of reaching the note editor. So every mouse
+   interaction hands focus back as soon as it finishes, everywhere in the app.
+   Text-entry fields are deliberately excluded: the project title's swapped-in input, instrument-row
+   renames, #bpmInput and the modal fields are things the user is actively typing into, and blurring
+   those mid-edit would commit/close them under the cursor. */
 document.addEventListener("mouseup",(e)=>{
-  if(e.target.tagName==="INPUT" && e.target.type==="range") e.target.blur();
+  const el = e.target && e.target.closest ? e.target.closest("button, input[type=range]") : null;
+  if(el) el.blur();
 });
+// <select> can't join the mouseup rule: blurring while its native popup is open dismisses the popup
+// before a value can be picked. It hands focus back on the two signals that mean "the popup is done"
+// instead — the value being committed (change), and the next mousedown anywhere else, which is the
+// only signal a popup dismissed WITHOUT a change ever gives us. That second case matters because the
+// piano roll calls preventDefault() on mousedown, which suppresses the browser's own focus change.
+let selectTouchedByMouse = false;
+document.addEventListener("mousedown",(e)=>{
+  const active = document.activeElement;
+  if(active && active.tagName==="SELECT" && active!==e.target) active.blur();
+  selectTouchedByMouse = !!(e.target && e.target.tagName==="SELECT");
+}, true);
+// a keyboard user arrowing through a focused select must keep it — Firefox fires "change" on every
+// arrow press, so the blur-on-change below only applies to a select the MOUSE opened
+document.addEventListener("keydown",()=>{ selectTouchedByMouse = false; }, true);
+document.addEventListener("change",(e)=>{
+  if(e.target.tagName==="SELECT" && selectTouchedByMouse){ selectTouchedByMouse = false; e.target.blur(); }
+});
+// drops keyboard focus from a clicked button/dropdown/slider on demand (never from a text field being
+// edited) — used by the selection paths below, where the same "the control isn't what's selected
+// anymore" rule has to fire without waiting for the next mouseup
+function blurFocusedControl(){
+  const el = document.activeElement;
+  if(!el || el===document.body) return;
+  const tag = el.tagName;
+  if(tag==="BUTTON" || tag==="SELECT" || (tag==="INPUT" && el.type==="range")) el.blur();
+}
 
 function showTooltip(x,y,text){
   const tip = document.getElementById("dragTooltip");
@@ -2031,7 +2382,9 @@ document.addEventListener("keydown", (e)=>{
       extendRegionsForNote(track, newNote);
       newIds.push(id);
     });
-    selectedNoteIds = new Set(newIds);
+    // the pasted notes are the new selection, and — like any other way notes become selected — that
+    // wins over any region/automation-dot/phantom selection that was still showing
+    selectNotesExclusively(newIds);
     renderNotes(); buildTrackList(); recomputeStepsTotal();
     toast("Pasted "+newIds.length+" note(s) at step "+pasteAt);
     e.preventDefault();
@@ -2221,6 +2574,14 @@ gridScroll.addEventListener("wheel",(e)=>{
 document.getElementById("zoomSlider").addEventListener("input",(e)=>{
   setZoom(Number(e.target.value));
 });
+// the same gesture over the arrange view's track list, zooming BAR_PX instead of STEP_W so the
+// timeline and the piano roll beneath it feel identical to pinch. Now that track blocks no longer
+// have draggable edges, this (and #trackZoomSlider) is the only way to change how long a block reads.
+document.getElementById("trackListCol").addEventListener("wheel",(e)=>{
+  if(!e.ctrlKey) return;
+  e.preventDefault();
+  setTrackZoom(BAR_PX*Math.exp(-e.deltaY*0.01));
+},{passive:false});
 
 /* ======================================================================
    UNDO / REDO BUTTONS
@@ -2329,7 +2690,7 @@ document.getElementById("instrumentList").addEventListener("input",(e)=>{
     if(track.id===state.selectedTrackId) document.getElementById("instTrackName").textContent=track.name;
   }
   if(role==="vol"){ track.volume = e.target.value/100; refreshAllTrackGains(); if(track.id===state.selectedTrackId) refreshInstrumentEditor(); if(track.id===state.advancedTrackId) renderAdvancedEditor(); }
-  if(role==="wave"){ pushHistory(); track.instrument.wave = e.target.value; fitRowControls(row); if(track.id===state.selectedTrackId) refreshInstrumentEditor(); }
+  if(role==="wave"){ pushHistory(); applyWaveSelection(track.instrument, e.target.value); fitRowControls(row); if(track.id===state.selectedTrackId) refreshInstrumentEditor(); }
 });
 
 /* ======================================================================
@@ -2493,36 +2854,6 @@ document.getElementById("trackListCol").addEventListener("mousedown",(e)=>{
     e.preventDefault(); e.stopPropagation();
     return;
   }
-  const handleEl = e.target.closest(".blockHandle");
-  if(handleEl){
-    const trackId = Number(handleEl.dataset.trackId);
-    const track = state.tracks.find(t=>t.id===trackId);
-    if(!track || !track.notes.length) return;
-    pushHistory();
-    let regionId = handleEl.dataset.regionId!=null ? Number(handleEl.dataset.regionId) : null;
-    if(regionId==null){
-      // lazily turn this track's auto-computed span into a real (single) region — same as the first
-      // "Split at Playhead" does — so there's something concrete for the edge grip to trim
-      const spb = stepsPerBar();
-      const minStep = Math.min(...track.notes.map(n=>n.step));
-      const maxStep = Math.max(...track.notes.map(n=>n.step+n.dur));
-      const region = {id: nextNoteId++, start: Math.floor(minStep/spb)*spb, end: Math.ceil(maxStep/spb)*spb};
-      track.regions = [region];
-      regionId = region.id;
-    }
-    const idx = track.regions.findIndex(r=>r.id===regionId);
-    const region = track.regions[idx];
-    const prevRegion = track.regions[idx-1], nextRegion = track.regions[idx+1];
-    blockResizeDrag = {
-      trackId, regionId,
-      edge: handleEl.classList.contains("blockHandleL") ? "left" : "right",
-      minBound: prevRegion ? prevRegion.end : 0,
-      maxBound: nextRegion ? nextRegion.start : STEPS_TOTAL
-    };
-    buildTrackList();
-    e.preventDefault(); e.stopPropagation();
-    return;
-  }
   const blockEl = e.target.closest(".trackBlock");
   if(blockEl){
     const rowEl = e.target.closest(".trackRow");
@@ -2647,7 +2978,9 @@ function bindSlider(id, cb){
   el.addEventListener("input",(e)=>{ cb(Number(e.target.value)); });
 }
 document.getElementById("waveSel").addEventListener("change",(e)=>{
-  const t=selectedTrack(); if(!t) return; pushHistory(); t.instrument.wave=e.target.value; renderInstrumentList();
+  const t=selectedTrack(); if(!t) return; pushHistory();
+  applyWaveSelection(t.instrument, e.target.value);
+  renderInstrumentList(); refreshInstrumentEditor();
 });
 bindSlider("volSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.volume=v/100; document.getElementById("volVal").textContent=v; refreshAllTrackGains(); renderInstrumentList(); renderAdvancedEditor(); });
 bindSlider("atkSlider",(v)=>{ const t=selectedTrack(); if(!t)return; t.instrument.attack=v; document.getElementById("atkVal").textContent=v+"ms"; });
@@ -2678,12 +3011,14 @@ document.getElementById("sampleInput").addEventListener("change",(e)=>{
   const reader = new FileReader();
   reader.onload = ()=>{
     actx.decodeAudioData(reader.result.slice(0), (buf)=>{
-      track.instrument.customBuffer = buf;
-      track.instrument.wave = "custom";
-      document.getElementById("waveSel").value="custom";
-      document.getElementById("sampleName").textContent = file.name;
+      // the upload joins the PROJECT's registry first and is then bound to the track that asked for it,
+      // so every other track's waveform dropdown gains it as a choice too
+      const entry = registerSample(file.name, buf);
+      applySampleToTrack(track, entry);
+      renderSamplePanel();
       renderInstrumentList();
-      toast("Loaded sample: "+file.name);
+      refreshInstrumentEditor(); // rebuilds #waveSel's options and reveals #sampleMenuBtn on the first upload
+      toast("Loaded sample: "+entry.name);
     }, (err)=>{ toast("Could not decode audio file"); });
   };
   reader.readAsArrayBuffer(file);
@@ -2697,8 +3032,61 @@ document.getElementById("bpmInput").addEventListener("change",(e)=>{ state.bpm =
 document.getElementById("timeSigSel").addEventListener("change",(e)=>{
   const [a,b] = e.target.value.split("/").map(Number); state.timeSig=[a,b]; drawGridLines(); drawGridRuler(); buildTrackList();
 });
+/* ---------- retype the selected notes, keeping their SPACING ----------
+   Changing the note type of a selection re-types every selected note to `newDur` and then re-lays the
+   run out so the GAPS between consecutive notes are exactly what they were — the gap is the invariant,
+   not the absolute positions. Turning a run of quarters into sixteenths therefore compacts it (and
+   turning them back stretches it out again) while the rhythm's proportions survive intact.
+   Pitch is deliberately ignored: the selection is treated as one time-ordered run even when it walks up
+   a scale across rows, which is exactly the case this was asked for. */
+function retypeSelectedNotes(track, newDur){
+  const sel = track.notes.filter(n=>selectedNoteIds.has(n.id)).sort((a,b)=>a.step-b.step);
+  if(!sel.length) return;
+  pushHistory();
+  // notes that START on the same step are a chord: they are laid out as ONE group so they keep sharing
+  // a step instead of being strung out into an arpeggio by the re-spacing
+  const groups = [];
+  sel.forEach(n=>{
+    const last = groups[groups.length-1];
+    if(last && last.step===n.step) last.notes.push(n);
+    else groups.push({step:n.step, notes:[n]});
+  });
+  // gap[i] = empty space between group i's end and group i+1's start, measured with the ORIGINAL
+  // durations (a group's end is its longest note's end). Notes that overlapped would give a negative
+  // gap; those are clamped to 0 rather than preserved, so a retype can never deepen an overlap into a
+  // pile of stacked tiles — back-to-back (gap 0) is the tightest result the re-spacing will produce.
+  const gaps = [];
+  for(let i=0;i<groups.length-1;i++){
+    const end = Math.max.apply(null, groups[i].notes.map(n=>n.step+n.dur));
+    gaps.push(Math.max(0, groups[i+1].step - end));
+  }
+  // the first group stays anchored on its existing step; every later group starts one newDur plus its
+  // own original gap further along. Nothing may end up negative or past the end of the grid — the span
+  // can grow, which is what the recomputeStepsTotal() below is for.
+  let cursor = Math.max(0, Math.min(groups[0].step, STEPS_TOTAL-newDur));
+  groups.forEach((g,i)=>{
+    g.notes.forEach(n=>{
+      n.step = cursor;
+      n.dur = newDur;
+      // a slur's start/end offsets are measured in steps from the note's own left edge, so shortening
+      // the tile has to pull them back in or the slide would be drawn hanging off the end of it
+      if(n.bendEndStep!=null) n.bendEndStep = Math.min(n.bendEndStep, newDur);
+      if(n.bendStartStep) n.bendStartStep = Math.min(n.bendStartStep, Math.max(0, newDur-0.15));
+      extendRegionsForNote(track, n);
+    });
+    if(i<groups.length-1) cursor = Math.max(0, Math.min(STEPS_TOTAL-newDur, cursor + newDur + gaps[i]));
+  });
+  // unselected notes are deliberately NOT consulted for collisions here: clamping a length or a step
+  // against a neighbouring tile would silently break the one thing this operation promises to keep
+  renderNotes(); buildTrackList(); recomputeStepsTotal();
+}
+
 document.getElementById("noteLenSel").addEventListener("change",(e)=>{
   state.noteLenSteps = Number(e.target.value);
+  // with notes selected the dropdown acts as a property editor on THEM — it re-types the selection and
+  // re-spaces it (below) instead of only deciding what the next placed note will look like
+  const track = selectedTrack();
+  if(track && selectedNoteIds.size){ retypeSelectedNotes(track, state.noteLenSteps); return; }
   // the ghost cell spans the note length, so a live change resizes it (and may push its right edge
   // past the grid end or out of view) — re-clamp, redraw and re-check scroll
   if(phantomSelection){
@@ -2708,7 +3096,31 @@ document.getElementById("noteLenSel").addEventListener("change",(e)=>{
   }
 });
 document.getElementById("keySel").addEventListener("change",(e)=>{ state.key=e.target.value; buildPianoLabels(); drawGridLines(); });
-document.getElementById("modeSel").addEventListener("change",(e)=>{ state.mode=e.target.value; buildPianoLabels(); drawGridLines(); });
+document.getElementById("modeSel").addEventListener("change",(e)=>{
+  const prevMode = state.mode;      // read BEFORE state.mode is overwritten below — the degree mapping
+  const nextMode = e.target.value;  // needs both ends of the switch to know where each note is going
+  // the two trivial no-ops (re-picking the mode that is already set, or a project with nothing in it)
+  // short-circuit ahead of pushHistory(), so they cannot clear the redo stack either
+  const anyNotes = state.tracks.some(t=>t.notes.length>0);
+  let moved = 0;
+  if(prevMode!==nextMode && anyNotes){
+    // one checkpoint for the WHOLE sweep, taken before anything moves, so a single Ctrl+Z puts every
+    // note back at once rather than unwinding the transposition note by note
+    pushHistory();
+    moved = transposeProjectToMode(prevMode, nextMode);
+    // same idiom as #splitBtn: the mapping can legitimately move nothing (switching to Chromatic, or a
+    // part that only uses degrees the two modes agree on), and a checkpoint identical to the state it
+    // was taken from is just clutter on the undo stack
+    if(!moved) undoStack.pop();
+  }
+  state.mode=nextMode;
+  buildPianoLabels(); drawGridLines();
+  // only redraw the tiles when pitches actually moved; the track list shows the same notes in miniature
+  if(moved){
+    renderNotes(); buildTrackList();
+    toast("Transposed "+moved+" note"+(moved===1?"":"s")+" from "+prevMode+" to "+nextMode);
+  }
+});
 document.getElementById("octaveSel").addEventListener("change",(e)=>{
   state.octaveFocus = Number(e.target.value);
   const midi=(state.octaveFocus+1)*12;
@@ -2723,6 +3135,82 @@ document.getElementById("octaveSel").addEventListener("change",(e)=>{
 function renderProjectTitle(){
   const span = document.getElementById("projectTitle");
   if(span) span.textContent = state.projectTitle || "Bit Beats Project";
+  syncSubHeaderLayout();
+}
+
+/* ---------- sub-header horizontal alignment ----------
+   The sub-header's first control (the BPM field) is meant to line up under #playBtn in the header row,
+   with a fixed clear run of space after the project title. Those two wants fight each other as soon as
+   the title gets long, so the resting x is:
+
+       bpmX = clamp(titleRight + SUBHEADER_TITLE_GAP_PX, playBtnX, INSTRUMENT_LIST_DEFAULT_W)
+
+   i.e. the title's required gap pushes the whole group right, never left of #playBtn, and never past
+   the instrument-list divider; past that the title truncates with its own ellipsis instead.
+   The clamp deliberately uses the CONSTANT 230, not #instrumentListCol's live width: dragging
+   #vResizerInstrumentList must not twitch the sub-header buttons, so the two are only ever visually
+   related at the column's default size.
+
+   On the gap's SIZE: "BPM sits under #playBtn by default" and "the title always keeps a fixed gap"
+   can only both be true if that gap is no wider than the room the default title actually leaves —
+   "Bit Beats Project" ends ~119px into the content box and #playBtn starts ~127px in, so anything
+   above ~8 pushes the group off the play button before the user has typed a thing. 8 is therefore the
+   value that satisfies both rules at rest; raise it and the default title starts shoving the group
+   right (the layout still behaves, the alignment just stops being the resting state). */
+const SUBHEADER_TITLE_GAP_PX = 8;         // clear space demanded between #projectTitle's right edge and the BPM field
+const INSTRUMENT_LIST_DEFAULT_W = 230;    // must match #instrumentListCol's default width in style.css
+function syncSubHeaderLayout(){
+  const sub = document.getElementById("subHeader");
+  const wrap = document.getElementById("projectTitleWrap");
+  const title = document.getElementById("projectTitle");
+  const play = document.getElementById("playBtn");
+  const group = sub && sub.querySelector(".hgroup");
+  // while the title is being renamed the span is swapped out for an <input> (beginProjectTitleEdit),
+  // which sizes itself — leave the layout exactly as it was until the edit commits
+  if(!sub || !wrap || !title || !play || !group) return;
+
+  const subCS = getComputedStyle(sub);
+  // #subHeader / #header both carry side padding, so the viewport x of the sub-header's CONTENT box is
+  // what the title and the flex gaps are actually measured from
+  const contentLeft = sub.getBoundingClientRect().left + (parseFloat(subCS.paddingLeft)||0);
+  const flexGap = parseFloat(subCS.columnGap) || 0;
+  const groupPadLeft = parseFloat(getComputedStyle(group).paddingLeft) || 0;
+
+  // Natural (uncapped) width the title box wants. Measured by briefly dropping BOTH caps this function
+  // assigned last pass and reading the browser's own layout, rather than by running the text through
+  // measureTextPx: the canvas fallback disagrees with real text layout by ~10px on this font stack
+  // (-apple-system does not resolve inside a canvas font string), and an over-estimate here is not
+  // harmless — it reserves room the title never uses, which at a small gap is enough to ellipsise a
+  // title that actually fits. Costs one forced reflow, on title edits and window resizes only.
+  const prevMax = title.style.maxWidth, prevWrapW = wrap.style.width, prevMargin = wrap.style.marginRight;
+  title.style.maxWidth = "none"; wrap.style.width = "auto"; wrap.style.marginRight = "0px";
+  const naturalW = title.getBoundingClientRect().width;
+  title.style.maxWidth = prevMax; wrap.style.width = prevWrapW; wrap.style.marginRight = prevMargin;
+
+  // Space that exists between the title's right edge and the BPM field no matter what anyone asks for:
+  // the wrap's own padding, then the sub-header's flex gap, then the group's left padding. It is NOT
+  // subtracted from the title's room (that is what was clipping it) — it is cancelled out by the
+  // margin below, so SUBHEADER_TITLE_GAP_PX means the rendered clear space and nothing else.
+  const wrapCS = getComputedStyle(wrap);
+  const structuralGap = (parseFloat(wrapCS.paddingLeft)||0) + (parseFloat(wrapCS.paddingRight)||0)
+                      + flexGap + groupPadLeft;
+  const wrapPadX = (parseFloat(wrapCS.paddingLeft)||0) + (parseFloat(wrapCS.paddingRight)||0);
+
+  // The title grows freely until the clamp: past it the title is what gives way, not the group's x.
+  const defaultX = play.getBoundingClientRect().left;
+  const maxTitleW = Math.max(40, INSTRUMENT_LIST_DEFAULT_W - contentLeft - SUBHEADER_TITLE_GAP_PX);
+  const titleW = Math.min(naturalW, maxTitleW);
+  const bpmX = Math.max(defaultX, contentLeft + titleW + SUBHEADER_TITLE_GAP_PX);
+
+  // the spare pixel is handed out only while the title already fits, where it cannot move the rendered
+  // right edge; once the cap is doing real truncation the room is exact
+  title.style.maxWidth = (naturalW <= titleW ? titleW+1 : titleW) + "px";
+  wrap.style.width = (titleW + wrapPadX) + "px";
+  // ...and the group is placed by margin rather than by inflating the wrap, so the title always gets its
+  // full titleW of room. The margin goes NEGATIVE whenever the requested gap is tighter than the
+  // structural one (which is what lets an 8px gap exist at all beside a 14px flex gap), and positive to
+  // push the group out to #playBtn's x when a short title leaves slack.
+  wrap.style.marginRight = (bpmX - contentLeft - titleW - structuralGap) + "px";
 }
 function beginProjectTitleEdit(){
   const wrap = document.getElementById("projectTitleWrap");
@@ -2776,7 +3264,12 @@ function serializeProject(){
       id:t.id, name:t.name, color:t.color, muted:t.muted, solo:t.solo, volume:t.volume, pan:t.pan,
       instrument: { wave:t.instrument.wave, volume:t.instrument.volume, attack:t.instrument.attack,
         release:t.instrument.release, eqLow:t.instrument.eqLow, eqMid:t.instrument.eqMid,
-        eqHigh:t.instrument.eqHigh, reverb:t.instrument.reverb, customBaseMidi:t.instrument.customBaseMidi },
+        eqHigh:t.instrument.eqHigh, reverb:t.instrument.reverb, customBaseMidi:t.instrument.customBaseMidi,
+        // the id only, never the buffer: a decoded AudioBuffer is not JSON, and shipping raw audio
+        // inside a project file is out of scope. Re-opening the file in the SAME session still finds
+        // its sample (the registry is alive); in a fresh one the id resolves to nothing and the track
+        // falls back to the generic "Custom" option, which is what it did before samples had names.
+        sampleId:t.instrument.sampleId??null },
       notes: t.notes.map(n=>({id:n.id, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null, bendStartStep:n.bendStartStep??0, bendEndStep:n.bendEndStep??null})),
       regions: t.regions ? t.regions.map(r=>({id:r.id, start:r.start, end:r.end})) : null,
       automation: cloneAutomation(t.automation)
@@ -3205,6 +3698,12 @@ function loadProject(data){
   document.getElementById("keySel").value=state.key; document.getElementById("modeSel").value=state.mode;
   document.getElementById("octaveSel").value=state.octaveFocus;
   document.getElementById("noteLenSel").value=state.noteLenSteps;
+  // assigning .value never fires "change", so the chord palette's key/mode labels would still be
+  // showing the OUTGOING project's scale degrees until the user touched one of those two selects.
+  // That same silence is what a load DEPENDS on where #modeSel is concerned: the change handler
+  // transposes every note by scale degree, and a project whose notes were saved in its own mode must
+  // come back exactly as written rather than being re-transposed out of it on the way in.
+  renderChordPalette();
   renderProjectTitle();
   nextTrackId=1; nextNoteId=1;
   state.tracks = (data.tracks||[]).map(t=>{
@@ -3213,6 +3712,9 @@ function loadProject(data){
     track.color = t.color||track.color; track.muted=!!t.muted; track.solo=!!t.solo; track.volume = t.volume??0.8;
     track.pan = t.pan??50;
     track.instrument = Object.assign(defaultInstrument(), t.instrument||{});
+    // the save file carries a sampleId but no audio — if this session's registry still holds that entry
+    // (a save/reload round trip without reloading the page) the buffer comes straight back
+    resolveTrackSample(track);
     track.notes = (t.notes||[]).map(n=>{ nextNoteId=Math.max(nextNoteId, (n.id||0)+1); return {id:n.id||nextNoteId++, step:n.step, pitch:n.pitch, dur:n.dur, bendTo:n.bendTo??null, bendStartStep:n.bendStartStep??0, bendEndStep:n.bendEndStep??null}; });
     track.regions = (t.regions||null) && t.regions.map(r=>{ nextNoteId=Math.max(nextNoteId, (r.id||0)+1); return {id:r.id||nextNoteId++, start:r.start, end:r.end}; });
     track.automation = defaultAutomation();
@@ -3230,6 +3732,9 @@ function loadProject(data){
   undoStack=[]; redoStack=[];
   state.loop = {enabled:false, start:0, end:stepsPerBar()};
   sizeGrid(); buildPianoLabels(); drawGridLines();
+  // state.samples is deliberately NOT reset here: the decoded buffers this session holds are the only
+  // thing a loaded project's sampleIds can possibly resolve against, since no audio is written to file
+  renderSamplePanel();
   renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList(); renderAdvancedEditor();
   recomputeStepsTotal();
   document.getElementById("loopBtn").classList.remove("on");
@@ -3240,9 +3745,362 @@ document.getElementById("newBtn").addEventListener("click", ()=>{
   STEPS_TOTAL = STEPS_TOTAL_BASE;
   state.tracks=[]; state.selectedTrackId=null; selectedNoteIds.clear(); selectedRegionIds.clear();
   state.advancedTrackId=null; selectedAutoPointIds.clear(); phantomSelection = null;
+  // the sample registry is project data too, so a genuinely new project starts with none — which also
+  // takes #sampleMenuBtn back out of .instTopRow (see updateSampleMenuBtn, via renderSamplePanel)
+  state.samples=[]; nextSampleId=1; sampleMenuOpen=false; stopSamplePreview();
   undoStack=[]; redoStack=[];
   initDefaultProject();
 });
+
+/* ======================================================================
+   DOCKABLE SIDE PANELS
+
+   A "dock panel" is a menu with two homes. While the advanced track editor is CLOSED it floats as a
+   dropdown under its own trigger button (the #colorPicker treatment). While the editor is OPEN the very
+   same element is re-parented into one of the editor's dock slots, so the two menus sit side by side in
+   one card instead of one covering the other. Toggling the editor has to move it live, in both
+   directions, which is why this is a registry rather than three lines inside the chord panel's own code:
+   the custom-sample-list panel is going to want exactly this behaviour in #advDockRight.
+
+   To add a panel: give it a body-level element, then call registerDockPanel({...}) once. Nothing else —
+   renderAdvancedEditor() already calls syncDockedPanels() on every open/close/resize of the editor.
+   The element must not assume a parent: it keeps its children across the move, and only the
+   .floating / .docked class swaps (style.css owns what each of those two looks like).
+   ====================================================================== */
+const DOCK_PANELS = []; // {panelId, slotId, anchorId, isOpen()}
+function registerDockPanel(cfg){ DOCK_PANELS.push(cfg); return cfg; }
+
+function placeDockPanel(cfg){
+  const el = document.getElementById(cfg.panelId);
+  const slot = document.getElementById(cfg.slotId);
+  if(!el || !slot) return;
+  // a closed panel hides its slot too, so an unused dock contributes neither width nor a divider line
+  if(!cfg.isOpen()){ el.classList.add("hidden"); slot.classList.add("hidden"); return; }
+  el.classList.remove("hidden");
+  // read off the editor's own .hidden class rather than state.advancedTrackId: renderAdvancedEditor()
+  // sets that class first and calls us second, so this is always the state the user can actually see
+  const advOpen = !document.getElementById("advancedEditor").classList.contains("hidden");
+  if(advOpen){
+    if(el.parentNode!==slot) slot.appendChild(el);
+    slot.classList.remove("hidden");
+    el.classList.remove("floating"); el.classList.add("docked");
+    el.style.left = ""; el.style.top = ""; // the fixed-position coords would survive the class swap otherwise
+  } else {
+    if(el.parentNode!==document.body) document.body.appendChild(el);
+    slot.classList.add("hidden");
+    el.classList.remove("docked"); el.classList.add("floating");
+    const anchor = document.getElementById(cfg.anchorId);
+    if(anchor){
+      const rect = anchor.getBoundingClientRect();
+      // measured AFTER .floating is applied, since that is the class that gives the panel its width.
+      // Anchored by its RIGHT edge because these triggers live at the right end of the sub-header —
+      // left-anchoring a 250px card there would hang it off the side of the window.
+      const w = el.offsetWidth || 252;
+      const left = Math.max(8, Math.min(rect.right-w, window.innerWidth-w-8));
+      el.style.left = Math.round(left)+"px";
+      el.style.top = Math.round(rect.bottom+6)+"px";
+    }
+  }
+}
+function syncDockedPanels(){ DOCK_PANELS.forEach(placeDockPanel); }
+
+/* ======================================================================
+   CHORD PALETTE (shell)
+
+   Presentation only. Nothing in here writes to state.tracks, places notes or transposes anything —
+   picking a root / quality / scale degree updates this panel's own highlight and stops there. The chord
+   NAMES are derived, because a palette that showed the wrong spelling for the current key would be
+   useless to look at, but naming is labelling, not playing.
+   ====================================================================== */
+const CHORD_QUALITIES = [
+  {id:"maj",  label:"maj",  suffix:""},     {id:"min",  label:"min",  suffix:"m"},
+  {id:"dim",  label:"dim",  suffix:"dim"},  {id:"aug",  label:"aug",  suffix:"aug"},
+  {id:"sus2", label:"sus2", suffix:"sus2"}, {id:"sus4", label:"sus4", suffix:"sus4"},
+  {id:"6",    label:"6",    suffix:"6"},    {id:"m6",   label:"m6",   suffix:"m6"},
+  {id:"7",    label:"7",    suffix:"7"},    {id:"maj7", label:"maj7", suffix:"maj7"},
+  {id:"m7",   label:"m7",   suffix:"m7"},   {id:"m7b5", label:"m7♭5", suffix:"m7♭5"},
+  {id:"dim7", label:"dim7", suffix:"dim7"}, {id:"9",    label:"9",    suffix:"9"},
+  {id:"maj9", label:"maj9", suffix:"maj9"}, {id:"m9",   label:"m9",   suffix:"m9"},
+  {id:"add9", label:"add9", suffix:"add9"}, {id:"11",   label:"11",   suffix:"11"},
+  {id:"13",   label:"13",   suffix:"13"}
+];
+// same substitution buildPianoLabels() makes: "#" is an ASCII stand-in stored in NOTE_NAMES, "♯" is
+// what a musician reads, and the palette is pure display so it always shows the real glyph
+function noteLabel(n){ return n.replace("#","♯"); }
+function qualitySuffix(id){ const q = CHORD_QUALITIES.find(x=>x.id===id); return q ? q.suffix : ""; }
+
+// Works out what each scale degree's triad is CALLED in the current key/mode by stacking scale thirds
+// and reading the resulting interval pattern — a major third + perfect fifth is a major triad and gets
+// an upper-case numeral, a minor third + diminished fifth is "vii°", and so on. No pitches leave this
+// function; it only ever returns strings for the palette to print.
+function diatonicChords(){
+  const keyIdx = Math.max(0, NOTE_NAMES.indexOf(state.key));
+  const raw = SCALES[state.mode] || SCALES.Major;
+  // Chromatic has all twelve notes and therefore no scale degrees to stack thirds on, so the palette
+  // falls back to the parallel major — the same seven chords a player would reach for over it anyway
+  const sc = raw.length===7 ? raw : SCALES.Major;
+  const ROMAN = ["I","II","III","IV","V","VI","VII"];
+  return sc.map((_,i)=>{
+    // degree i+k, carrying the +12 for every time the stack wraps past the top of the scale
+    const at = k=> sc[(i+k)%7] + 12*Math.floor((i+k)/7);
+    const third = at(2)-at(0), fifth = at(4)-at(0);
+    let quality = "maj", mark = "", roman = ROMAN[i];
+    if(third===3 && fifth===6){ quality="dim"; mark="°"; roman=roman.toLowerCase(); }
+    else if(third===3){ quality="min"; roman=roman.toLowerCase(); }
+    else if(fifth===8){ quality="aug"; mark="+"; }
+    const root = NOTE_NAMES[(keyIdx+sc[i])%12];
+    return {root, quality, degree:roman+mark, name:noteLabel(root)+qualitySuffix(quality)};
+  });
+}
+
+let chordMenuOpen = false;
+// purely local to this panel — read by nothing outside it, and deliberately not part of `state` (it is
+// UI position, not project data, so it stays out of save files and out of undo/redo)
+let chordSel = {root:null, quality:"maj", degree:null};
+// until the user picks a root by hand the root row tracks the Key select, so the palette opens already
+// pointing at the key you are working in; once they choose one it stops moving under them
+let chordRootTouched = false;
+
+function buildChordPalette(){
+  const rootGrid = document.getElementById("chordRootGrid");
+  NOTE_NAMES.forEach(n=>{
+    const b = document.createElement("button");
+    b.className = "chordBtn"; b.dataset.root = n; b.textContent = noteLabel(n);
+    rootGrid.appendChild(b);
+  });
+  const qGrid = document.getElementById("chordQualityGrid");
+  CHORD_QUALITIES.forEach(q=>{
+    const b = document.createElement("button");
+    b.className = "chordBtn"; b.dataset.quality = q.id; b.textContent = q.label;
+    qGrid.appendChild(b);
+  });
+}
+
+function renderChordPalette(){
+  if(!chordRootTouched) chordSel.root = state.key;
+  document.getElementById("chordKeyLabel").textContent = noteLabel(state.key)+" "+state.mode;
+
+  document.querySelectorAll("#chordRootGrid .chordBtn").forEach(b=>{
+    b.classList.toggle("active", b.dataset.root===chordSel.root);
+  });
+  // the title is the only place the two axes are shown combined, which is what makes a bare "m7" button
+  // legible as "the chord you would get is Gm7" without the panel having to spell it out in the grid
+  document.querySelectorAll("#chordQualityGrid .chordBtn").forEach(b=>{
+    b.classList.toggle("active", b.dataset.quality===chordSel.quality);
+    b.title = noteLabel(chordSel.root||state.key)+qualitySuffix(b.dataset.quality);
+  });
+
+  const grid = document.getElementById("chordDiatonicGrid");
+  const chords = diatonicChords();
+  grid.title = (SCALES[state.mode]||[]).length===7
+    ? ("Diatonic chords of "+noteLabel(state.key)+" "+state.mode)
+    : ("Chromatic has no scale degrees — showing "+noteLabel(state.key)+" Major");
+  grid.innerHTML = "";
+  chords.forEach((c,i)=>{
+    const b = document.createElement("button");
+    b.className = "chordBtn chordDegBtn"+(chordSel.degree===i?" active":"");
+    b.dataset.degree = i;
+    b.title = c.name;
+    const deg = document.createElement("span"); deg.className="deg"; deg.textContent = c.degree;
+    const nm = document.createElement("span"); nm.className="nm"; nm.textContent = c.name;
+    b.appendChild(deg); b.appendChild(nm);
+    grid.appendChild(b);
+  });
+}
+
+function closeChordMenu(){
+  chordMenuOpen = false;
+  document.getElementById("chordMenuBtn").classList.remove("on");
+  syncDockedPanels();
+}
+
+document.getElementById("chordMenuBtn").addEventListener("click",()=>{
+  chordMenuOpen = !chordMenuOpen;
+  document.getElementById("chordMenuBtn").classList.toggle("on", chordMenuOpen);
+  if(chordMenuOpen) renderChordPalette();
+  syncDockedPanels();
+});
+// Selection is visual and local, exactly as specified: no note is written, nothing is transposed, and
+// state.tracks is never touched. Picking a root or a quality drops the scale-degree highlight because
+// the degree tile stands for a specific root+quality pair that no longer holds; picking a degree lights
+// its own root and quality back up, so the three rows always agree with each other.
+document.getElementById("chordRootGrid").addEventListener("click",(e)=>{
+  const b = e.target.closest(".chordBtn"); if(!b) return;
+  chordSel.root = b.dataset.root; chordSel.degree = null; chordRootTouched = true;
+  renderChordPalette();
+});
+document.getElementById("chordQualityGrid").addEventListener("click",(e)=>{
+  const b = e.target.closest(".chordBtn"); if(!b) return;
+  chordSel.quality = b.dataset.quality; chordSel.degree = null;
+  renderChordPalette();
+});
+document.getElementById("chordDiatonicGrid").addEventListener("click",(e)=>{
+  const b = e.target.closest(".chordBtn"); if(!b) return;
+  const c = diatonicChords()[Number(b.dataset.degree)]; if(!c) return;
+  chordSel.degree = Number(b.dataset.degree);
+  chordSel.root = c.root; chordSel.quality = c.quality; chordRootTouched = true;
+  renderChordPalette();
+});
+// outside-click dismissal is the FLOATING presentation's rule only (mirroring closeColorPicker's
+// handler). Docked, the panel is a column of the advanced editor like #advTabs is — clicking a note in
+// the roll must no more close it than it closes the automation lane beside it.
+document.addEventListener("mousedown",(e)=>{
+  if(!chordMenuOpen) return;
+  const el = document.getElementById("chordPanel");
+  if(!el.classList.contains("floating")) return;
+  if(e.target.closest("#chordPanel") || e.target.closest("#chordMenuBtn")) return;
+  closeChordMenu();
+});
+// added as a SEPARATE listener rather than folded into the #keySel / #modeSel handlers above, so the
+// palette's label refresh cannot collide with whatever else those two selects grow to do. Registered
+// after them, so state.key / state.mode are already updated by the time this runs.
+["keySel","modeSel"].forEach(id=>{
+  document.getElementById(id).addEventListener("change", ()=>{ renderChordPalette(); });
+});
+
+buildChordPalette();
+renderChordPalette();
+registerDockPanel({panelId:"chordPanel", slotId:"advDockLeft", anchorId:"chordMenuBtn", isOpen:()=>chordMenuOpen});
+
+/* ======================================================================
+   CUSTOM SAMPLE MANAGER
+
+   The registry's second face: a list of the project's uploads where a row is exactly a gray play button
+   and the sample's title. The title renames in place using the same idiom as instrument names and the
+   project title (plain text, swapped for a bordered <input> on double-click, committed on Enter/blur) —
+   and because the waveform dropdowns label their options from state.samples, a rename lands in both of
+   them at once.
+
+   Its trigger lives beside #uploadSampleBtn and only exists once there is something to manage. The panel
+   is a dock panel (see registerDockPanel above): a dropdown under that button while the advanced editor
+   is closed, and docked into #advDockRight — right of the automation lane, behind the light-gray
+   divider — while it is open.
+   ====================================================================== */
+let sampleMenuOpen = false;
+// exactly one preview voice at a time: clicking play again (or on another row) replaces the one that is
+// sounding instead of layering another copy on top of it
+let samplePreviewSrc = null;
+function stopSamplePreview(){
+  if(!samplePreviewSrc) return;
+  // stop() on a source that already ran to the end throws in some engines, and the only thing that
+  // matters here is that a still-sounding one goes quiet — so a failure is genuinely nothing to do
+  try{ samplePreviewSrc.onended = null; samplePreviewSrc.stop(); }catch(_){}
+  samplePreviewSrc = null;
+}
+function previewSample(id){
+  const s = findSample(id);
+  // a registry entry with no buffer is reachable: a project loaded from JSON knows a sampleId but the
+  // save file never carried the audio, so there is nothing decoded to play
+  if(!s || !s.buffer){ toast("That sample has no audio loaded"); return; }
+  if(actx.state==="suspended") actx.resume();
+  stopSamplePreview();
+  const src = actx.createBufferSource(); src.buffer = s.buffer;
+  const g = actx.createGain(); g.gain.value = 0.9;
+  // straight to the destination, deliberately NOT through a track's chain: this auditions the FILE, so
+  // it must not arrive coloured by whichever track's EQ, reverb and volume happen to point at it
+  src.connect(g); g.connect(actx.destination);
+  src.onended = ()=>{ if(samplePreviewSrc===src) samplePreviewSrc = null; };
+  src.start();
+  samplePreviewSrc = src;
+}
+
+// the trigger exists only while the registry has something in it, and an empty registry also forces the
+// panel shut, so it can never be left hanging open over a list with no rows
+function updateSampleMenuBtn(){
+  const btn = document.getElementById("sampleMenuBtn");
+  if(!btn) return;
+  const has = state.samples.length>0;
+  if(!has && sampleMenuOpen){ sampleMenuOpen = false; stopSamplePreview(); }
+  btn.classList.toggle("hidden", !has);
+  btn.classList.toggle("on", sampleMenuOpen);
+  fitInstTopRow(); // the row just gained or lost a button, so its label budget changed
+}
+function closeSampleMenu(){
+  sampleMenuOpen = false;
+  document.getElementById("sampleMenuBtn").classList.remove("on");
+  stopSamplePreview();
+  syncDockedPanels();
+}
+
+function renderSamplePanel(){
+  const list = document.getElementById("sampleList");
+  if(!list) return;
+  const n = state.samples.length;
+  document.getElementById("sampleCountLabel").textContent = n ? (n+(n===1?" file":" files")) : "";
+  list.innerHTML = "";
+  state.samples.forEach(s=>{
+    const row = document.createElement("div");
+    row.className = "sampleRow"; row.dataset.id = s.id;
+    row.innerHTML = `
+      <button class="samplePlayBtn" data-role="samplePlay" title="Preview this sample">&#9654;</button>
+      <span class="sampleNameText" data-role="sampleNameText" title="Double-click to rename">${escapeHtml(s.name)}</span>`;
+    list.appendChild(row);
+  });
+  updateSampleMenuBtn();
+  syncDockedPanels();
+}
+
+/* ---------- rename a sample: double-click, exactly like an instrument name ----------
+   A plain "dblclick" listener is enough here (unlike the instrument list, which has to detect its own
+   double-click from e.detail): clicking a sample row selects nothing and rebuilds nothing, so the span
+   the first click landed on is still the same node when the second one arrives. */
+function beginSampleNameEdit(span){
+  const row = span.closest(".sampleRow"); if(!row) return;
+  const s = findSample(Number(row.dataset.id)); if(!s) return;
+  const input = document.createElement("input");
+  input.type = "text"; input.dataset.role = "sampleName"; input.value = s.name;
+  const commit = ()=>{
+    if(!input.isConnected) return; // re-entry guard: renderSamplePanel below removes the input, which blurs it
+    const name = input.value.trim();
+    if(name && name!==s.name){
+      s.name = name;
+      // the dropdowns are the whole point of renaming, so push the new label into both of them now,
+      // each re-fitted to its own select's width, rather than waiting for some unrelated rerender
+      renderInstrumentList();
+      refreshInstrumentEditor();
+    }
+    renderSamplePanel();
+  };
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown",(e)=>{
+    if(e.key==="Enter"){ commit(); e.preventDefault(); }
+    else if(e.key==="Escape"){ input.value = s.name; commit(); e.preventDefault(); }
+    // the app-wide shortcuts (Delete, arrows, Ctrl+Z) must not act on keys typed into a name field
+    e.stopPropagation();
+  });
+  span.replaceWith(input);
+  input.focus(); input.select();
+}
+
+document.getElementById("sampleMenuBtn").addEventListener("click",()=>{
+  if(!state.samples.length) return;
+  sampleMenuOpen = !sampleMenuOpen;
+  document.getElementById("sampleMenuBtn").classList.toggle("on", sampleMenuOpen);
+  if(sampleMenuOpen) renderSamplePanel(); else stopSamplePreview();
+  syncDockedPanels();
+});
+document.getElementById("samplePanel").addEventListener("click",(e)=>{
+  const btn = e.target.closest("[data-role=samplePlay]"); if(!btn) return;
+  const row = btn.closest(".sampleRow"); if(!row) return;
+  previewSample(Number(row.dataset.id));
+});
+document.getElementById("samplePanel").addEventListener("dblclick",(e)=>{
+  const span = e.target.closest("[data-role=sampleNameText]"); if(!span) return;
+  beginSampleNameEdit(span);
+  e.preventDefault(); e.stopPropagation();
+});
+// outside-click dismissal belongs to the FLOATING presentation only, exactly as it does for the chord
+// palette: docked, this panel is a column of the advanced editor and clicking the piano roll must no
+// more close it than it closes the automation lane beside it
+document.addEventListener("mousedown",(e)=>{
+  if(!sampleMenuOpen) return;
+  const el = document.getElementById("samplePanel");
+  if(!el.classList.contains("floating")) return;
+  if(e.target.closest("#samplePanel") || e.target.closest("#sampleMenuBtn")) return;
+  closeSampleMenu();
+});
+registerDockPanel({panelId:"samplePanel", slotId:"advDockRight", anchorId:"sampleMenuBtn",
+  isOpen:()=> sampleMenuOpen && state.samples.length>0});
 
 /* ======================================================================
    RESIZABLE PANELS (self-contained local drag handling — these panels are pure
@@ -3280,20 +4138,19 @@ makeResizer(document.getElementById("rollDivider"), document.getElementById("adv
 makeResizer(document.getElementById("arrangeDivider"), document.getElementById("arrange"),
   {axis:"y", min:100, max:520});
 // re-measure (never rebuild) the existing rows when the instrument-list column is widened/narrowed:
-// name widths, control fitting and the pattern preview all key off the row's own measured width
+// both the name width and the control fitting key off the row's own measured width
 function refreshInstrumentRowFit(){
   document.querySelectorAll("#instrumentList .instrumentRow").forEach(row=>{
-    const track = state.tracks.find(t=>t.id===Number(row.dataset.id));
     sizeNameInput(row.querySelector('input[data-role=name]'));
     fitRowControls(row);
-    const canvas = row.querySelector(".instrumentRowPattern");
-    if(canvas && track) drawInstrumentRowPattern(track, canvas);
   });
 }
 makeResizer(document.getElementById("vResizerInstrumentList"), document.getElementById("instrumentListCol"),
   {axis:"x", min:150, max:520, onResize: refreshInstrumentRowFit});
+// the two labels in .instTopRow are sized from a measurement, so they have to be re-fitted on every
+// drag frame — nothing else in the instrument editor keys off the panel's width
 makeResizer(document.getElementById("vResizerInstEditor"), document.getElementById("instEditor"),
-  {axis:"x", min:220, max:700, invert:true});
+  {axis:"x", min:220, max:700, invert:true, onResize: fitInstTopRow});
 
 /* ======================================================================
    TOAST
@@ -3312,13 +4169,19 @@ function initDefaultProject(){
   const t1 = makeTrack("Lead Square",0); buildChain(t1); state.tracks.push(t1);
   const t2 = makeTrack("Bass Triangle",1); t2.instrument.wave="triangle"; buildChain(t2); state.tracks.push(t2);
   state.selectedTrackId = t1.id;
+  renderSamplePanel(); // empty registry on a fresh project: hides #sampleMenuBtn and its panel
   renderInstrumentList(); refreshInstrumentEditor(); renderNotes(); buildTrackList(); renderAdvancedEditor();
   const midi=(state.octaveFocus+1)*12;
   gridScroll.scrollTop = midiToRow(midi)*ROW_H+GRID_RULER_H - gridScroll.clientHeight/2;
   syncPianoScroll();
   renderPlayheads();
 }
-window.addEventListener("resize", ()=>{});
+// both of these are pure measurement passes over widths that only the viewport decides, so they are
+// the two things that must be redone whenever the window changes size
+// syncDockedPanels joins them because a FLOATING dock panel is pinned to its trigger's viewport rect,
+// which the window moving out from under it invalidates (a docked one re-measures for free via flex)
+window.addEventListener("resize", ()=>{ syncSubHeaderLayout(); fitInstTopRow(); syncDockedPanels(); });
 initDefaultProject();
+fitInstTopRow(); // initDefaultProject()'s renderProjectTitle() already covers syncSubHeaderLayout()
 
 })();
