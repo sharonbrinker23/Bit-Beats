@@ -1,0 +1,581 @@
+:root{
+  --bg0:#101014; --bg1:#17171c; --bg2:#1e1e25; --bg3:#26262e;
+  --line:#33333d; --line-strong:#45454f;
+  --text:#e8e8ee; --text-dim:#8a8a97;
+  --accent:#5ee6a8; --accent2:#6fa8ff; --accent3:#ff9d6f;
+  --danger:#ff6b6b; --warn:#ffd166;
+  --row-light:#2c2c34; --row-dark:#1c1c22; --row-c:rgba(111,168,255,.18);
+  /* Middle C (C4) is the one C that should catch the eye against a keyboard's worth of blue C rows —
+     --warn's amber reads immediately against --row-c's cooler blue and stays clear of --accent's mint,
+     which already means "selected" everywhere else in the app */
+  --row-c4:rgba(255,209,102,.22);
+  /* the rule between a docked side panel and the advanced editor's own content. One step lighter than
+     --line-strong on purpose: it separates two live menus rather than two rows of the same list, so it
+     has to read as a deliberate light-gray divider instead of the app's usual near-invisible hairline */
+  --dock-line:#5a5a66;
+}
+*{box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  margin:0; background:var(--bg0); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  font-size:13px; display:flex; flex-direction:column; overflow:hidden;
+}
+button{
+  font-family:inherit; font-size:12px; color:var(--text); background:var(--bg3);
+  border:1px solid var(--line-strong); border-radius:5px; padding:5px 10px; cursor:pointer;
+}
+button:hover{background:#31313a;}
+button:active{transform:translateY(1px);}
+button.primary{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+button.primary:hover{background:#7cf0bb;}
+button.small{padding:3px 7px; font-size:11px;}
+button.icon{width:26px; height:26px; padding:0; display:inline-flex; align-items:center; justify-content:center;}
+button.icon.flat{background:transparent; border:none; color:#fff; font-size:14px;}
+button.icon.flat:hover{background:rgba(255,255,255,.12); border-radius:5px;}
+select,input[type=number],input[type=text]{
+  font-family:inherit; font-size:12px; color:var(--text); background:var(--bg3);
+  border:1px solid var(--line-strong); border-radius:5px; padding:4px 6px;
+}
+input[type=range]{accent-color:var(--accent);}
+/* ===== no sticky "still selected" look on any clicked control =====
+   App-wide generalisation of the .instrumentRow / #instEditor rules further down: a control that was
+   merely CLICKED must leave no focus ring behind, because a lingering ring on a button or dropdown
+   reads as persistent on/selected state (the app already has real toggles for that — .on / .active —
+   and those are class-driven, so they are untouched here). Keyboard focus is deliberately NOT killed:
+   :focus-visible only matches when the browser judges the focus keyboard-driven, so tabbing still
+   draws a clear ring and the app stays navigable without a mouse. The matching blur pass lives in
+   app.js (mouseup for buttons/sliders, change/next-mousedown for selects) — CSS alone can hide the
+   ring but the control would still be eating Delete/arrow keypresses meant for the note editor. */
+button:focus, select:focus, input[type=range]:focus{outline:none;}
+button:focus-visible, select:focus-visible, input[type=range]:focus-visible{outline:1px solid var(--accent2); outline-offset:1px;}
+label.field{display:flex; flex-direction:column; gap:2px; font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.04em;}
+
+/* ===== HEADER ===== */
+#header{
+  display:flex; align-items:center; gap:14px; padding:8px 12px; background:var(--bg1);
+  border-bottom:1px solid var(--line); flex-wrap:wrap; row-gap:8px;
+}
+#logo{font-weight:800; font-size:16px; letter-spacing:.02em; color:var(--accent); margin-right:6px; white-space:nowrap;}
+.hgroup{display:flex; align-items:flex-end; gap:8px; padding:0 8px; border-left:1px solid var(--line);}
+.hgroup:first-of-type{border-left:none;}
+/* icon-only undo/redo: .icon already boxes them at 26x26, but they share a flex-end group with the
+   New / Save / Load text buttons whose height comes from their own line box — state the same 26px
+   here so a platform font-metric difference can never leave the two kinds of button a pixel apart */
+#undoBtn, #redoBtn{height:26px; align-self:flex-end;}
+#playBtn{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#0a1a12;font-size:14px;}
+#holdPosBtn{width:30px;height:30px;border-radius:50%;}
+#loopBtn{width:30px;height:30px;border-radius:50%;font-size:15px;}
+#loopBtn.on{background:var(--accent2); color:#071226; border-color:var(--accent2);}
+/* ===== SUB-HEADER: project title + musical settings ===== */
+#subHeader{
+  display:flex; align-items:center; gap:14px; padding:6px 12px; background:var(--bg1);
+  border-bottom:1px solid var(--line); flex-wrap:wrap; row-gap:8px; flex-shrink:0;
+}
+/* the groups inside the sub-header read as ONE continuous strip of musical settings, so they get no
+   vertical rules between them (the #header groups above keep theirs). The side padding drops to 4px
+   because it no longer has to hold a line off its neighbours — 4 + the 14px flex gap + 4 still leaves
+   a group break noticeably wider than the 8px gap between controls inside a group. */
+#subHeader .hgroup{border-left:none; padding:0 4px;}
+/* width AND both side margins are assigned by syncSubHeaderLayout(): the right margin lands the BPM
+   group at a computed x (never let flex shrink the wrap back out of that position), and the left one is
+   the negative pull-back that puts the title's TEXT under #logo's — nothing here may set either, or the
+   two would fight every layout pass. */
+#projectTitleWrap{display:flex; align-items:center; min-width:0; padding-right:2px; flex-shrink:0;}
+/* plain text until double-clicked; the input swapped in during editing is the only state with a
+   visible boundary (see the #projectTitle input rule below).
+   No max-width here on purpose: syncSubHeaderLayout() sets it every time the title or the window
+   changes, since the cap is whatever keeps the title SUBHEADER_TITLE_GAP_PX clear of the BPM field. */
+#projectTitle{
+  font-size:13px; font-weight:600; color:var(--text); cursor:text; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis;
+  padding:3px 6px; border:1px solid transparent; border-radius:5px;
+}
+#projectTitle:hover{border-color:var(--line);}
+#projectTitleWrap input{
+  font-size:13px; font-weight:600; padding:3px 6px; border-radius:5px;
+  border:1px solid var(--accent2); background:var(--bg0); color:var(--text); min-width:120px;
+}
+#projectTitleWrap input:focus{outline:none;}
+#metroBtn{
+  width:26px; height:26px; border-radius:5px; padding:0; color:#fff;
+  display:inline-flex; align-items:center; justify-content:center;
+}
+#metroBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+/* pushed to the far right of the row by margin-left:auto — that is deliberately the ONLY thing holding
+   its position, so syncSubHeaderLayout()'s title/BPM measurement stays untouched by it. align-self:stretch
+   + flex-end drops the label.field inside it onto the same bottom edge as the Key/Mode/Octave fields,
+   which sit at the bottom of their own flex-end groups; since it is the same .field unit (caption over
+   control) both its caption and its button line up with theirs. */
+#chordMenuWrap{margin-left:auto; align-self:stretch; display:flex; align-items:flex-end; padding:0 4px; flex-shrink:0;}
+#chordMenuBtn{height:26px; padding:0 10px; font-size:11px; white-space:nowrap;}
+#chordMenuBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+#holdPosBtn.on{background:var(--accent3); color:#2a1200; border-color:var(--accent3); font-weight:600;}
+
+/* ===== ARRANGE AREA: INSTRUMENT LIST (left) + TRACK LIST (right) ===== */
+#arrange{
+  display:flex; background:var(--bg1); border-bottom:1px solid var(--line);
+  height:180px; flex-shrink:0;
+}
+#rollDivider, .hResizer{ height:8px; background:var(--bg1); border-bottom:1px solid var(--line); flex-shrink:0; cursor:row-resize; }
+#rollDivider:hover, .hResizer:hover{ background:#26262e; }
+.vResizer{ width:6px; flex-shrink:0; background:var(--bg1); border-left:1px solid var(--line); border-right:1px solid var(--line); cursor:col-resize; }
+.vResizer:hover{ background:#31313a; }
+#instrumentListCol{
+  width:230px; flex-shrink:0; background:var(--bg2);
+  display:flex; flex-direction:column; overflow:hidden;
+}
+#instrumentListScroll{flex:1; overflow-y:auto;}
+/* the icon bar and the zoom-slider bar beneath it read as ONE continuous footer: same (darker)
+   background as the sliders sit on, no divider between them, and only a couple of pixels of
+   padding around the buttons so the bar hugs them */
+#instrumentToolbar{
+  display:flex; align-items:center; justify-content:flex-start; gap:6px; padding:2px 6px;
+  background:var(--bg2); border-top:1px solid var(--line); flex-shrink:0;
+}
+#instrumentListZoomBar{
+  display:flex; align-items:center; gap:6px; padding:3px 8px; background:var(--bg2);
+  flex-shrink:0;
+}
+#instrumentListZoomBar .zoomBarIcon{
+  font-size:11px; color:var(--text-dim); flex-shrink:0; width:11px; text-align:center;
+}
+#instrumentListZoomBar input[type=range]{flex:1 1 auto; min-width:0;}
+
+/* ===== custom thin-line range sliders for the instrument-list zoom bar ===== */
+#instrumentListZoomBar input[type=range]{
+  -webkit-appearance:none; appearance:none; background:transparent; height:16px; margin:0;
+}
+#instrumentListZoomBar input[type=range]::-webkit-slider-runnable-track{
+  height:3px; background:var(--text-dim); border-radius:2px;
+}
+#instrumentListZoomBar input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none; width:3px; height:15px; border-radius:1px;
+  background:#fff; border:none; margin-top:-6px; cursor:pointer;
+}
+#instrumentListZoomBar input[type=range]::-moz-range-track{
+  height:3px; background:var(--text-dim); border-radius:2px;
+}
+#instrumentListZoomBar input[type=range]::-moz-range-thumb{
+  width:3px; height:15px; border-radius:1px; background:#fff; border:none; cursor:pointer;
+}
+/* must clear exactly as much vertical space as the track list's own sticky chrome (#loopBar 12px
+   + #trackListRuler 18px), or every instrument row sits offset from the track row beside it */
+#instrumentListHeaderSpacer{
+  position:sticky; top:0; z-index:4; height:30px; background:var(--bg1); border-bottom:1px solid var(--line);
+}
+#instrumentList{display:flex; flex-direction:column;}
+/* Instrument rows are deliberately PLAIN: no track-colored wash, no colored header strip — that
+   treatment now lives on the track-preview blocks in the track list (see .trackBlock). Selection is
+   the only decoration: a subtle background tint plus a green accent bar down the row's left edge. */
+.instrumentRow{
+  display:flex; flex-direction:column; gap:0; padding:0; border-bottom:1px solid var(--line);
+  cursor:pointer; height:46px; justify-content:flex-start; position:relative; z-index:0; overflow:hidden;
+}
+.instrumentRow.selected{background:#232a26; box-shadow:inset 3px 0 0 var(--accent); z-index:1;}
+.instrumentRow .tname{
+  position:relative; z-index:1; height:var(--hdrh,22px); flex-shrink:0;
+  display:flex; align-items:center; gap:6px; padding:0 8px; min-width:0; flex:0 1 auto;
+  color:var(--text); font-weight:700; font-size:11px;
+}
+/* the name renders as plain text until it's double-clicked (see the #instrumentList dblclick handler),
+   at which point it's swapped for a real <input> that shows its own visible border while editing.
+   Width is assigned in JS (sizeNameInput) from the measured text, so the box hugs its text instead
+   of stretching into a big empty clickable strip. */
+.instrumentRow .tname .nameText{
+  cursor:text; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:10px;
+  padding:1px 2px; border:1px solid transparent;
+}
+.instrumentRow .tname input{
+  background:var(--bg0); border:1px solid var(--accent2); border-radius:3px; color:inherit;
+  font-weight:inherit; font-size:inherit; width:auto; min-width:10px; max-width:100%;
+  padding:0 2px; flex:0 1 auto; text-overflow:ellipsis;
+}
+.instrumentRow .tname input:focus{outline:none;}
+.instrumentRow .tctrls{
+  position:relative; z-index:1; display:flex; align-items:center; gap:5px; padding:0 8px;
+  flex:1 1 auto; min-height:0;
+}
+.instrumentRow .tctrls select[data-role=wave]{flex:1 1 auto; min-width:0; font-size:10px; padding:1px 2px;}
+.instrumentRow .tctrls input[type=range][data-role=vol]{width:40px; flex-shrink:0;}
+.instrumentRow .tctrls .mutebtn, .instrumentRow .tctrls .solobtn{flex-shrink:0;}
+/* ---- single-line (shrunk) rows: controls move to the RIGHT of the name, header fills the row ---- */
+.instrumentRow.oneline{flex-direction:row; align-items:center;}
+.instrumentRow.oneline .tname{height:100%; padding:0 0 0 6px;}
+.instrumentRow.oneline .tctrls{flex:0 0 auto; margin-left:auto; height:100%; gap:4px; padding:0 6px 0 6px;}
+.instrumentRow.oneline .tctrls select[data-role=wave]{flex:0 0 auto; width:64px;}
+/* progressive waveform-select abbreviation (see fitRowControls/applyWaveTier in app.js) */
+.instrumentRow .tctrls select[data-role=wave].wtier1{flex:0 0 auto; width:34px;}
+.instrumentRow .tctrls select[data-role=wave].wtier2{flex:0 0 auto; width:22px; padding-left:0; padding-right:0;}
+.instrumentRow .tctrls input[type=range][data-role=vol].volNarrow{width:26px;}
+.instrumentRow .swatch{width:9px;height:9px;border-radius:50%;flex-shrink:0;cursor:pointer;}
+.instrumentRow .swatch:hover{outline:2px solid #fff;}
+/* selection is signalled by the row's own tint + accent bar — kill any incidental focus ring that
+   would read as "the instrument / waveform picker got selected too" */
+.instrumentRow select:focus, .instrumentRow button:focus, .instrumentRow input:focus{outline:none;}
+/* the mute/solo buttons and the volume slider need the keyboard ring restored here too — the :focus
+   rule above out-specifies the global :focus-visible rule at the top of the file, so without this a
+   tabbing user would land on them completely blind */
+.instrumentRow select:focus-visible, .instrumentRow button:focus-visible, .instrumentRow input:focus-visible{outline:1px solid var(--accent2); outline-offset:-1px;}
+#instEditor, #instEditor *{outline:none;}
+#instEditor :focus-visible{outline:1px solid var(--accent2); outline-offset:1px;}
+.mutebtn,.solobtn{width:18px;height:18px;font-size:9px;padding:0;border-radius:3px;}
+.mutebtn.on{background:var(--danger); color:#2a0000; border-color:var(--danger);}
+.solobtn.on{background:var(--warn); color:#2a1e00; border-color:var(--warn);}
+#trackListCol{flex:1; overflow:auto; position:relative;}
+#trackListInner{position:relative;}
+#trackListRuler{
+  position:sticky; top:12px; height:18px; z-index:4; background:var(--bg1); border-bottom:1px solid var(--line);
+}
+.trackRow{
+  height:46px; border-bottom:1px solid var(--line); position:relative; overflow:hidden; background-image:
+    repeating-linear-gradient(to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent var(--barpx));
+}
+/* A track-preview block mirrors the advanced editor's lane card: an OPAQUE track-colored header
+   strip (.trackBlockHeader, carrying the track name) stacked on a TRANSLUCENT track-colored body
+   (the block's own background, set inline by renderTrackBlock as rgba(track.color,.35)), with the
+   mini note-pattern canvas floating over that body but under the header. */
+.trackBlock{
+  position:absolute; border-radius:5px; opacity:.95;
+  display:flex; flex-direction:column; padding:0; font-size:10px; overflow:hidden; white-space:nowrap;
+  border:1px solid rgba(0,0,0,.35); cursor:grab;
+}
+.trackBlockHeader{
+  position:relative; z-index:2; flex-shrink:0; display:flex; align-items:center; padding:0 6px;
+  color:#111; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  border-radius:4px 4px 0 0; pointer-events:none;
+}
+.trackBlockPattern{position:absolute; left:0; z-index:1; pointer-events:none;}
+.trackBlock.dragging{cursor:grabbing; opacity:1; box-shadow:0 0 0 2px #fff;}
+/* Two independent selection cues sharing one ring: .trackSelected = every block of the track the
+   editor is currently pointed at, .regionSelected = the individual regions in a multi-selection.
+   outline-offset is NEGATIVE so the ring is drawn just INSIDE the block's own box: a block that starts
+   at bar 1 sits flush against x=0 of its row, and .trackRow's overflow:hidden would shave an outward
+   ring clean off that left edge (the top/bottom edges survive on TRACK_BLOCK_INSET alone). */
+.trackBlock.regionSelected, .trackBlock.trackSelected{outline:2px solid #fff; outline-offset:-2px; opacity:1; z-index:2;}
+#trackListPlayhead{position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:5; pointer-events:none;}
+/* the flag is a separate element (see #trackListPlayheadFlag) kept pinned to the visible scroll
+   position via JS, rather than a pseudo-element anchored to the (possibly scrolled-away) top of #trackListPlayhead */
+#trackListPlayheadFlag{
+  position:absolute; width:14px; height:13px; background:#fff; z-index:7; pointer-events:none;
+  clip-path:polygon(0% 0%, 100% 0%, 100% 55%, 50% 100%, 0% 55%);
+  box-shadow:0 0 4px rgba(255,255,255,.7);
+}
+
+/* ===== INSTRUMENT EDITOR ===== */
+#instEditor{
+  width:460px; flex-shrink:0; display:flex; flex-direction:column; align-items:stretch; gap:5px;
+  padding:8px 14px; background:var(--bg1); overflow:hidden;
+}
+.instTopRow{
+  display:flex; flex-direction:row; align-items:flex-end; gap:10px; flex-shrink:0; overflow:hidden;
+}
+/* .squeezed is the LAST resort, applied by fitInstTopRow only once both buttons have already shrunk to
+   their one-character floor: up to that point the Track / Waveform fields hold at their natural size and
+   the buttons do all the giving (that is the shrink the user is dragging for), and only then do these
+   two fields start yielding — which is what keeps the buttons from being clipped off the end of the row
+   at the panel's minimum width. Both truncate gracefully: #instTrackName ellipsises, the select drops
+   back to its bare dropdown arrow. */
+.instTopRow.squeezed > label.field{min-width:0;}
+/* fitInstTopRow() owns these two labels: nowrap so "Upload Sample" can't quietly wrap to two lines
+   instead of reporting an overflow, and no flex-shrink so the row's measured overflow is a true
+   "these need N more px" signal rather than the buttons silently squashing their own text */
+#advToggleBtn, #uploadSampleBtn, #sampleMenuBtn{white-space:nowrap; flex:0 0 auto;}
+/* a bare <select> sizes itself to its WIDEST option, so a long sample filename in the custom section of
+   the list would silently drag this field (and the whole top row with it) out past the panel's edge.
+   The cap is what makes fitSampleLabel's budget a real number: the select can no longer grow to swallow
+   any name, so a name that doesn't fit gets its "…" instead of quietly stealing the buttons' space. */
+#waveSel{max-width:150px;}
+#instTrackName{
+  color:var(--text); font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; max-width:150px; display:inline-block;
+}
+.instSliders{display:grid; grid-template-columns:repeat(3,1fr); gap:2px 12px;}
+.instFooter{display:flex; align-items:flex-end; gap:10px; justify-content:space-between;}
+.slidergroup{display:flex; flex-direction:column; gap:2px;}
+.slidergroup .val{font-size:10px; color:var(--text-dim);}
+#advToggleBtn.on, #sampleMenuBtn.on{background:var(--accent); color:#0a1a12; border-color:var(--accent); font-weight:600;}
+
+/* ===== ADVANCED TRACK EDITOR (AUTOMATION) ===== */
+#advancedEditor{
+  display:flex; position:relative; height:165px; flex-shrink:0; background:var(--bg1);
+  border-bottom:1px solid var(--line); padding:14px; gap:14px; box-sizing:border-box;
+}
+#advTabs{
+  width:140px; flex-shrink:0; display:flex; flex-direction:column; gap:10px; padding:2px 0;
+  box-sizing:border-box; transform:translateY(-10px);
+}
+/* bare ✕ glyph — no button chrome at rest, so it doesn't compete with the parameter tabs below it.
+   The gray rounded container only materialises under the pointer (and on keyboard focus, which
+   otherwise has no affordance at all here), matching button.icon.flat's hover treatment above.
+   box-sizing:border-box is global, so dropping the border leaves the 22x22 box unchanged. */
+#advCloseBtn{
+  align-self:flex-start; width:22px; height:22px; padding:0; font-size:11px; flex-shrink:0;
+  background:transparent; border:none; color:var(--text); border-radius:5px;
+  display:inline-flex; align-items:center; justify-content:center;
+}
+#advCloseBtn:hover, #advCloseBtn:focus-visible{background:rgba(255,255,255,.12); border-radius:5px;}
+#advTabGrid{
+  flex:1; display:grid; grid-template-columns:repeat(2,1fr); grid-auto-rows:min-content;
+  align-content:center; gap:6px;
+}
+.advTabBtn{padding:8px 4px; font-size:11px;}
+.advTabBtn.active{background:var(--accent2); color:#071226; border-color:var(--accent2); font-weight:600;}
+#advLaneScroll{
+  flex:1; overflow-x:auto; overflow-y:hidden; position:relative;
+}
+#advLaneInner{position:relative; height:100%; min-width:100%;}
+#advLaneHeader{
+  position:sticky; top:0; left:0; height:22px; font-size:11px; font-weight:700; color:#111;
+  display:flex; align-items:center; padding:0 12px; z-index:2; white-space:nowrap;
+  border-radius:8px 8px 0 0;
+}
+#advLaneCanvas{position:absolute; top:22px; left:0; z-index:0; border-radius:0 0 8px 8px;}
+#advPointLayer{position:absolute; top:22px; left:0; right:0; bottom:0; z-index:1;}
+.autoPoint{
+  position:absolute; width:11px; height:11px; margin-left:-5.5px; margin-top:-5.5px; border-radius:50%;
+  background:#fff; border:1px solid rgba(0,0,0,.5); cursor:grab; z-index:2;
+}
+.autoPoint.selected{outline:2px solid var(--accent2); z-index:3;}
+
+/* ===== DOCK SLOTS INSIDE THE ADVANCED EDITOR =====
+   Two fixed-width columns that a floating panel can be re-parented into (see registerDockPanel in
+   app.js). Each carries the divider on the edge that faces the editor's own content, so left and right
+   docks both read as "this menu, then a rule, then the automation lane". overflow:hidden is what forces
+   the panel inside to scroll ITSELF rather than spilling out when #rollDivider drags the editor down to
+   its 60px minimum — the slot is only ever as tall as the editor's content box. */
+.advDock{flex:0 0 auto; width:244px; display:flex; align-items:stretch; min-width:0; overflow:hidden;}
+#advDockLeft{padding-right:12px; border-right:1px solid var(--dock-line);}
+#advDockRight{padding-left:12px; border-left:1px solid var(--dock-line);}
+
+/* ===== CHORD PALETTE =====
+   One element, two presentations. .floating is the #colorPicker treatment (fixed, own card, JS-placed
+   under the trigger); .docked strips all of that back off so the panel is just a plain column inside
+   the advanced editor's own card. Everything below the two variants is shared, so the grids look
+   identical in both homes. */
+#chordPanel{display:flex; flex-direction:column; gap:6px; font-size:11px;}
+#chordPanel.floating{
+  position:fixed; z-index:300; width:252px; max-height:70vh; overflow-y:auto;
+  background:var(--bg2); border:1px solid var(--line-strong); border-radius:8px;
+  padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+}
+#chordPanel.docked{
+  flex:1 1 auto; min-width:0; height:100%; overflow-y:auto; padding:0 6px 0 0;
+  background:transparent; border:none; border-radius:0; box-shadow:none;
+}
+/* a grid, not the space-between flex row the sample panel's head uses, because this head has a THIRD
+   item that has to sit on the panel's centre line: two equal 1fr side columns are what centre the auto
+   column between them no matter how wide the title and the key label are. align-items:center rather
+   than baseline, since a bordered button has no baseline worth sharing with two spans.
+   The docked presentation is ~225px wide against the floating one's ~230px, so the side items get
+   min-width:0 + ellipsis: they must give way to the button rather than push it off-centre or wrap. */
+.chordPanelHead{display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:6px; flex-shrink:0;}
+.chordPanelTitle{font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+#chordKeyLabel{font-size:10px; font-weight:700; color:var(--accent); white-space:nowrap; min-width:0; overflow:hidden; text-overflow:ellipsis; text-align:right;}
+/* button.primary's colours at the palette's own scale — .small is still too tall next to two 10px
+   captions, and justify-self keeps it centred in its column even once the padding shrinks */
+#chordAddBtn{justify-self:center; padding:2px 12px; font-size:10px; line-height:1.3; border-radius:4px;}
+.chordSection{display:flex; flex-direction:column; gap:3px; flex-shrink:0;}
+.chordSectionLabel{font-size:9px; text-transform:uppercase; letter-spacing:.05em; color:var(--text-dim);}
+#chordRootGrid{display:grid; grid-template-columns:repeat(6,1fr); gap:2px;}
+#chordQualityGrid{display:grid; grid-template-columns:repeat(5,1fr); gap:2px;}
+#chordDiatonicGrid{display:grid; grid-template-columns:repeat(7,1fr); gap:2px;}
+/* .advTabBtn's look, shrunk: same chrome and the same blue "this one is picked" fill, but sized for a
+   6/5/7-column grid inside a 165px-tall panel instead of a 2-column tab strip */
+.chordBtn{
+  padding:3px 2px; font-size:10px; line-height:1.15; border-radius:4px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.chordBtn.active{background:var(--accent2); color:#071226; border-color:var(--accent2); font-weight:600;}
+/* the root row is the KEY-ish axis of the palette, so it takes the mint accent rather than the blue —
+   that keeps root and quality visually distinguishable when both are lit at once */
+#chordRootGrid .chordBtn.active{background:var(--accent); color:#0a1a12; border-color:var(--accent);}
+/* a degree tile is two stacked lines (roman numeral over the chord's spelled name), so it can't rely on
+   the button's own line box — it becomes a tiny flex column instead */
+.chordDegBtn{display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1px; padding:2px 1px;}
+.chordDegBtn .deg{font-size:9px; line-height:1; color:var(--text-dim);}
+.chordDegBtn .nm{font-size:10px; line-height:1.1; font-weight:700;}
+.chordDegBtn.active .deg, .chordDegBtn.active .nm{color:#071226;}
+
+/* ===== CUSTOM SAMPLE MANAGER =====
+   Deliberately a copy of the chord palette's two presentations, so the two dock panels read as siblings
+   in the advanced editor rather than as two different kinds of thing that happen to sit side by side.
+   Only the docked padding is mirrored: #advDockLeft owns the gap on the chord panel's divider side, and
+   #advDockRight already supplies this panel's left gap, so all that is needed here is a little room on
+   the right for the internal scrollbar. overflow-y:auto on both variants is what lets the list scroll
+   inside itself when #rollDivider drags the editor down to its 60px minimum. */
+#samplePanel{display:flex; flex-direction:column; gap:6px; font-size:11px;}
+#samplePanel.floating{
+  position:fixed; z-index:300; width:252px; max-height:70vh; overflow-y:auto;
+  background:var(--bg2); border:1px solid var(--line-strong); border-radius:8px;
+  padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+}
+#samplePanel.docked{
+  flex:1 1 auto; min-width:0; height:100%; overflow-y:auto; padding:0 4px 0 0;
+  background:transparent; border:none; border-radius:0; box-shadow:none;
+}
+.samplePanelHead{display:flex; align-items:baseline; justify-content:space-between; gap:8px; flex-shrink:0;}
+.samplePanelTitle{font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim);}
+#sampleCountLabel{font-size:10px; font-weight:700; color:var(--accent); white-space:nowrap;}
+#sampleList{display:flex; flex-direction:column; gap:3px;}
+/* a row is exactly two things: the play button, then the title. The title takes every pixel the button
+   doesn't, and min-width:0 is what lets it ellipsise instead of pushing the row wider than the dock. */
+.sampleRow{display:flex; align-items:center; gap:6px; min-width:0; flex-shrink:0;}
+.samplePlayBtn{
+  flex:0 0 auto; width:20px; height:20px; padding:0; display:inline-flex; align-items:center;
+  justify-content:center; font-size:9px; line-height:1; border-radius:4px;
+  background:#4a4a55; border-color:#5a5a66; color:var(--text);
+}
+.samplePlayBtn:hover{background:#5a5a66;}
+/* the rename idiom's two states: no border while displaying (so the row reads as a label, not a form),
+   a visible one while editing — same contract as .instrumentRow .tname's span/input pair */
+.sampleNameText{
+  flex:1 1 auto; min-width:0; padding:2px 4px; border:1px solid transparent; border-radius:4px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:text;
+}
+.sampleNameText:hover{border-color:var(--line);}
+.sampleRow input[data-role=sampleName]{
+  flex:1 1 auto; min-width:0; width:auto; font-size:11px; padding:2px 4px; border-radius:4px;
+}
+
+/* ===== PIANO ROLL ===== */
+#rollWrap{flex:1; display:flex; overflow:hidden; position:relative;}
+#pianoCol{
+  width:64px; flex-shrink:0; overflow:hidden; background:var(--bg1); position:relative;
+}
+/* the header spacer deliberately has no right border of its own, so it reads as one continuous bar
+   with the grid ruler beside it instead of a separate, walled-off box — the divider between the piano
+   keys and the note grid below picks back up on #pianoColInner instead */
+#pianoColHeaderSpacer{height:18px; border-bottom:1px solid var(--line); background:var(--bg1); position:relative; z-index:6;}
+#pianoColInner{position:relative; border-right:1px solid var(--line);}
+.pianoRowLabel{
+  position:absolute; left:0; right:0; display:flex; align-items:center; justify-content:flex-end;
+  padding-right:8px; font-size:10px; color:var(--text-dim); border-bottom:1px solid #000;
+}
+.pianoRowLabel.c-row{color:var(--text); font-weight:700; font-size:11px;}
+.pianoRowLabel.in-scale{color:var(--accent2);}
+
+#gridScroll{flex:1; overflow:auto; position:relative; background:var(--bg0);}
+#gridInner{position:relative;}
+#gridRuler{
+  position:sticky; top:0; height:18px; z-index:6; background:var(--bg1); border-bottom:1px solid var(--line);
+  cursor:ew-resize;
+}
+canvas#gridCanvas{position:absolute; top:18px; left:0; z-index:1;}
+#noteLayer{position:absolute; top:18px; left:0; z-index:2;}
+.note{
+  position:absolute; border-radius:3px; cursor:grab; border:1px solid rgba(0,0,0,.4);
+  box-shadow:0 1px 2px rgba(0,0,0,.4);
+}
+.note.selected{outline:2px solid #fff; z-index:3;}
+#phantomCell{
+  position:absolute; border:2px dashed #fff; border-radius:3px; z-index:3; pointer-events:none;
+  box-sizing:border-box; background:rgba(255,255,255,.08);
+}
+.bendHandle{position:absolute; right:-3px; top:0; width:7px; height:100%; cursor:crosshair; z-index:4;}
+.leftHandle{position:absolute; left:-3px; top:0; width:7px; height:100%; cursor:ew-resize; z-index:4;}
+.note:hover .bendHandle, .note:hover .leftHandle{background:rgba(255,255,255,.3); border-radius:2px;}
+.bendStub{
+  position:absolute; border-radius:3px; opacity:.85; cursor:move; z-index:2;
+  border:1px solid rgba(0,0,0,.4);
+}
+.bendStub:hover{opacity:1; box-shadow:0 0 0 1px #fff;}
+.bendSlide{position:absolute; pointer-events:none; z-index:1; opacity:.6; overflow:visible;}
+.bendStartHandle{
+  position:absolute; width:9px; height:9px; margin-left:-4.5px; margin-top:-4.5px; border-radius:50%;
+  background:var(--accent2); border:1px solid rgba(0,0,0,.6); cursor:ew-resize; z-index:4;
+}
+.bendStartHandle:hover{outline:2px solid #fff;}
+#selectionBox{
+  position:absolute; border:1px solid var(--accent2); background:rgba(111,168,255,.15); z-index:4; pointer-events:none; display:none;
+}
+#playhead{
+  position:absolute; top:0; bottom:0; width:2px; background:#fff; z-index:7; pointer-events:none; box-shadow:0 0 6px #fff; cursor:ew-resize;
+}
+/* sticky (not JS-positioned) so it tracks the same native, compositor-driven scroll as the ruler itself —
+   a JS scroll-event handler updating "top" on every scroll tick visibly lagged a frame or more behind
+   the ruler's own sticky positioning, especially during fast/inertial scrolling.
+   Horizontal placement must come from `transform`, not `left`: giving a sticky element any non-auto
+   inset (including left) makes the browser stick that axis too, so a JS-driven `left` here would freeze
+   the grip in the viewport instead of scrolling with the grid whenever it's scrolled programmatically
+   (e.g. jumping the playhead from the track list auto-scrolls the grid out from under it).
+   margin-top cancels out #gridRuler's reserved 18px of flow height above it: without this, the grip's
+   natural (unstuck) resting spot is 18px down — below the ruler, at the very first note row — so at
+   scrollTop 0 it sits outside the header and only slides up into the ruler band once you've scrolled
+   past that 18px and stickiness actually engages. */
+#playheadGrip{
+  position:sticky; top:0; width:16px; height:14px; background:#fff; border-radius:0 0 4px 4px;
+  pointer-events:auto; cursor:ew-resize; box-shadow:0 0 4px rgba(255,255,255,.7); z-index:7;
+  margin-left:-7px; margin-top:-18px;
+}
+#trackListPlayhead{cursor:ew-resize;}
+#loopBar{
+  position:sticky; top:0; height:12px; z-index:6; background:var(--bg1); border-bottom:1px solid var(--line);
+}
+#loopRegion{
+  position:absolute; top:0; height:100%; background:rgba(111,168,255,.35); border-left:2px solid var(--accent2); border-right:2px solid var(--accent2);
+  display:none; cursor:grab;
+}
+#loopRegion.enabled{background:rgba(94,230,168,.35); border-color:var(--accent);}
+.loopHandle{position:absolute; top:0; width:7px; height:100%; cursor:ew-resize;}
+#loopHandleL{left:-3px;} #loopHandleR{right:-3px;}
+#rollFooter{
+  display:flex; justify-content:space-between; align-items:center; padding:4px 12px; background:var(--bg1);
+  border-top:1px solid var(--line); font-size:11px; color:var(--text-dim); flex-shrink:0;
+}
+#zoomControl{display:flex; align-items:center; gap:6px;}
+#zoomSlider{width:110px;}
+#dragTooltip{
+  position:fixed; background:#000; color:#fff; font-size:11px; padding:2px 6px; border-radius:4px; pointer-events:none; z-index:50; display:none;
+}
+.hidden{display:none !important;}
+::-webkit-scrollbar{width:11px; height:11px;}
+::-webkit-scrollbar-track{background:var(--bg1);}
+::-webkit-scrollbar-thumb{background:var(--bg3); border-radius:6px; border:2px solid var(--bg1);}
+::-webkit-scrollbar-thumb:hover{background:#3c3c46;}
+#toast{
+  position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#000; color:#fff; padding:8px 16px;
+  border-radius:6px; font-size:12px; z-index:100; opacity:0; transition:opacity .2s; pointer-events:none;
+}
+#toast.show{opacity:.92;}
+
+/* ===== TRACK COLOR PICKER ===== */
+#colorPicker{
+  position:fixed; z-index:300; background:var(--bg2); border:1px solid var(--line-strong); border-radius:8px;
+  padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.5); display:flex; flex-direction:column; gap:8px; width:150px;
+}
+#colorPalette{display:grid; grid-template-columns:repeat(4,1fr); gap:6px;}
+.colorSwatchBtn{
+  width:28px; height:28px; border-radius:50%; border:1px solid rgba(0,0,0,.4); cursor:pointer; padding:0;
+}
+.colorSwatchBtn:hover{outline:2px solid #fff;}
+#colorCustomPanel{display:flex; flex-direction:column; gap:8px;}
+#colorSVWrap, #colorHueWrap{position:relative; cursor:crosshair;}
+#colorSVCanvas, #colorHueCanvas{display:block; border-radius:4px; width:100%;}
+#colorSVDot{
+  position:absolute; width:10px; height:10px; margin-left:-5px; margin-top:-5px; border-radius:50%;
+  border:2px solid #fff; box-shadow:0 0 2px rgba(0,0,0,.8); pointer-events:none;
+}
+#colorHueDot{
+  position:absolute; top:-2px; width:4px; height:18px; margin-left:-2px; background:#fff;
+  box-shadow:0 0 2px rgba(0,0,0,.8); pointer-events:none;
+}
+
+/* ===== SAVE / EXPORT MODAL ===== */
+.modalOverlay{
+  position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:200;
+}
+.modalBox{
+  background:var(--bg1); border:1px solid var(--line-strong); border-radius:10px; padding:20px;
+  width:300px; display:flex; flex-direction:column; gap:12px; box-shadow:0 8px 30px rgba(0,0,0,.5);
+}
+.modalBox h3{margin:0; font-size:14px;}
+.modalField input, .modalField select{width:100%;}
+.modalStatus{font-size:11px; color:var(--text-dim); min-height:14px; line-height:1.45;}
+.loopField{display:flex; align-items:flex-end; gap:12px;}
+.checkRow{display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text); cursor:pointer;}
+.checkRow input[type=checkbox]{accent-color:var(--accent); width:14px; height:14px; margin:0; cursor:pointer;}
+.loopCountField{flex:0 0 auto;}
+.loopCountField input{width:64px;}
+.loopCountField input:disabled{opacity:.45;}
+.modalActions{display:flex; justify-content:flex-end; gap:8px;}

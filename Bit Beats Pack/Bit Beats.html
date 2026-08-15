@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bit Beats</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<input type="file" id="loadInput" accept=".json,.mid,.midi" class="hidden">
+<input type="file" id="sampleInput" accept="audio/*" class="hidden">
+
+<!-- ================= HEADER ================= -->
+<div id="header">
+  <div id="logo">&#9642; BIT BEATS</div>
+
+  <div class="hgroup">
+    <button id="playBtn" title="Play / Pause">&#9654;</button>
+    <button id="holdPosBtn" title="When on, pausing keeps the playhead where it is. When off, pausing jumps it back to the start.">&#9209;</button>
+    <button id="loopBtn" class="icon" title="Toggle loop playback">&#8635;</button>
+  </div>
+
+  <div class="hgroup" style="margin-left:auto;">
+    <!-- undo / redo are drawn as inline SVG rather than the ↶ / ↷ glyphs they replace: those two
+         codepoints render at wildly different weights and sizes per platform font (and are missing
+         outright on some), while a hand-written path is identical everywhere. Each is a 300° ring
+         band with the arrowhead cut at the top — undo sweeps anticlockwise and points LEFT, redo is
+         the mirror image and points RIGHT. -->
+    <button id="undoBtn" class="icon" title="Undo (Ctrl+Z)">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+        <path d="M4.9 8.7A8.2 8.2 0 1 0 12 4.6L12 7A5.8 5.8 0 1 1 6.98 9.9Z"/>
+        <path d="M12 3 12 8.6 7.2 5.8Z"/>
+      </svg>
+    </button>
+    <button id="redoBtn" class="icon" title="Redo (Ctrl+Shift+Z)">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+        <path d="M19.1 8.7A8.2 8.2 0 1 1 12 4.6L12 7A5.8 5.8 0 1 0 17.02 9.9Z"/>
+        <path d="M12 3 12 8.6 16.8 5.8Z"/>
+      </svg>
+    </button>
+    <button id="newBtn">New</button>
+    <button id="saveBtn" class="primary">Save</button>
+    <button id="loadBtn">Load</button>
+  </div>
+</div>
+
+<!-- ================= SUB-HEADER (project title + musical settings) ================= -->
+<div id="subHeader">
+  <div id="projectTitleWrap">
+    <span id="projectTitle" title="Double-click to rename the project">Bit Beats Project</span>
+  </div>
+
+  <div class="hgroup">
+    <label class="field">BPM<input type="number" id="bpmInput" min="30" max="300" value="120" style="width:56px;"></label>
+    <label class="field">Time Sig
+      <select id="timeSigSel">
+        <option value="4/4" selected>4/4</option>
+        <option value="3/4">3/4</option>
+        <option value="6/8">6/8</option>
+        <option value="2/4">2/4</option>
+        <option value="5/4">5/4</option>
+      </select>
+    </label>
+    <label class="field">Note Length
+      <select id="noteLenSel">
+        <option value="16">Whole</option>
+        <option value="8">Half</option>
+        <option value="4" selected>Quarter</option>
+        <option value="2">Eighth</option>
+        <option value="1">Sixteenth</option>
+      </select>
+    </label>
+    <!-- flat metronome silhouette: hollow trapezoid body (even-odd ring) + pendulum rod and weight -->
+    <button id="metroBtn" title="Toggle metronome click">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+        <path fill-rule="evenodd" d="M12 1.5 20.5 21.5H3.5L12 1.5zM12 6.4 6.9 18.4h10.2L12 6.4z"/>
+        <path d="M9.9 18.4 13.6 6.5l1.2.4-3.6 11.5z"/>
+        <path d="M9.6 12.3 13.5 11.1 14 12.7 10.1 13.9z"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="hgroup">
+    <label class="field">Key
+      <select id="keySel"></select>
+    </label>
+    <label class="field">Mode
+      <select id="modeSel">
+        <option>Major</option><option>Minor</option><option>Dorian</option>
+        <option>Phrygian</option><option>Lydian</option><option>Mixolydian</option>
+        <option>Locrian</option><option>Chromatic</option>
+      </select>
+    </label>
+    <label class="field">Octave Focus
+      <select id="octaveSel"></select>
+    </label>
+  </div>
+
+  <!-- chord palette trigger. The wrapper is deliberately NOT a .hgroup: syncSubHeaderLayout() measures
+       sub.querySelector(".hgroup") to place the BPM field, and a wrapper that can never match that
+       query can never perturb it. margin-left:auto (in CSS) is what parks it on the right, so it also
+       stays out of the title/BPM run of space entirely. The label.field INSIDE it is the same
+       caption-above-control unit every other control in this row uses, so the button reads as part of
+       the row rather than as a bare button floating at the end of it — .field is not .hgroup, so the
+       query above is still unaffected. -->
+  <div id="chordMenuWrap">
+    <label class="field">Chord Palette
+      <button id="chordMenuBtn" title="Chord palette for the current key">Chords</button>
+    </label>
+  </div>
+</div>
+
+<!-- ============ ARRANGE: INSTRUMENT LIST + TRACK LIST ============ -->
+<div id="arrange">
+  <div id="instrumentListCol">
+    <div id="instrumentListScroll">
+      <div id="instrumentListHeaderSpacer"></div>
+      <div id="instrumentList"></div>
+    </div>
+    <div id="instrumentToolbar">
+      <button id="addTrackBtnTop" class="icon flat" title="Add Track">&#43;</button>
+      <button id="splitBtn" class="icon flat" title="Split at Playhead">&#9986;</button>
+      <button id="deleteTrackBtn" class="icon flat" title="Delete Track">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M9 3h6l1 2h4v2H4V5h4l1-2zm-3 6h12l-1 12H7L6 9zm3 2v8h1.5v-8H9zm4.5 0v8H15v-8h-1.5z"/></svg>
+      </button>
+    </div>
+    <div id="instrumentListZoomBar">
+      <span class="zoomBarIcon" title="Track row height (vertical shrink)">&#8597;</span>
+      <input type="range" id="instrumentRowHeightSlider" min="34" max="90" value="46" title="Track row height (vertical shrink)">
+      <span class="zoomBarIcon" title="Track zoom (horizontal)">&#8596;</span>
+      <!-- min/max must match BAR_PX_MIN/BAR_PX_MAX in app.js (see src/ui/track-list.js): setTrackZoom() writes the zoom the
+           ctrl+wheel pinch gesture landed on back into this slider, so a narrower range here would
+           silently pin the thumb short of the real zoom the track list is actually showing -->
+      <input type="range" id="trackZoomSlider" min="20" max="200" value="60" title="Track zoom (horizontal)">
+    </div>
+  </div>
+  <div id="vResizerInstrumentList" class="vResizer" title="Drag to resize"></div>
+  <div id="trackListCol">
+    <div id="trackListInner">
+      <div id="trackListPlayhead"></div>
+    </div>
+  </div>
+  <div id="vResizerInstEditor" class="vResizer" title="Drag to resize"></div>
+
+  <!-- ================= INSTRUMENT EDITOR ================= -->
+  <div id="instEditor">
+    <div class="instTopRow">
+      <label class="field">Track<span id="instTrackName">—</span></label>
+      <label class="field">Waveform
+        <select id="waveSel">
+          <option value="square">Square (8-bit)</option>
+          <option value="pulse25">Pulse 25%</option>
+          <option value="pulse12">Pulse 12.5%</option>
+          <option value="triangle">Triangle</option>
+          <option value="sawtooth">Sawtooth</option>
+          <option value="sine">Sine</option>
+          <option value="noise">Noise (Drum)</option>
+          <!-- data-sample marks the "custom" end of the list as JS-owned: syncWaveCustomOptions()
+               replaces everything carrying that attribute with one option per uploaded sample, and
+               only re-emits this generic entry when the registry can't name one -->
+          <option value="custom" data-sample="generic">Custom Sample</option>
+        </select>
+      </label>
+      <!-- labels are the FULL words on purpose: the trailing "…" is no longer decorative, it is added
+           by fitInstTopRow() only when the panel got too narrow to show the whole word -->
+      <button id="advToggleBtn" class="small" title="Advanced track editor (automation)">Advanced</button>
+      <button id="uploadSampleBtn" class="small" title="Upload a custom sample">Upload Sample</button>
+      <!-- starts hidden and is revealed by updateSampleMenuBtn() as soon as the project has an upload;
+           its label joins the same truncation set as the two above (see fitInstTopRow) -->
+      <button id="sampleMenuBtn" class="small hidden" title="Manage the project's uploaded samples">Samples</button>
+      <span id="sampleName" style="font-size:10px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+    </div>
+    <div class="instSliders">
+      <div class="slidergroup"><span>Volume <span class="val" id="volVal">80</span></span>
+        <input type="range" id="volSlider" min="0" max="100" value="80"></div>
+      <div class="slidergroup"><span>Attack <span class="val" id="atkVal">5ms</span></span>
+        <input type="range" id="atkSlider" min="0" max="300" value="5"></div>
+      <div class="slidergroup"><span>Release <span class="val" id="relVal">80ms</span></span>
+        <input type="range" id="relSlider" min="5" max="800" value="80"></div>
+      <div class="slidergroup"><span>EQ Low <span class="val" id="eqLowVal">0dB</span></span>
+        <input type="range" id="eqLowSlider" min="-24" max="24" value="0"></div>
+      <div class="slidergroup"><span>EQ Mid <span class="val" id="eqMidVal">0dB</span></span>
+        <input type="range" id="eqMidSlider" min="-24" max="24" value="0"></div>
+      <div class="slidergroup"><span>EQ High <span class="val" id="eqHighVal">0dB</span></span>
+        <input type="range" id="eqHighSlider" min="-24" max="24" value="0"></div>
+    </div>
+
+    <div class="instFooter">
+      <div class="slidergroup"><span>Reverb <span class="val" id="revVal">0%</span></span>
+        <input type="range" id="revSlider" min="0" max="100" value="0"></div>
+      <div class="hgroup">
+        <button id="transUpBtn" title="Transpose whole track up 1 semitone">Track &#9650; Semi</button>
+        <button id="transDownBtn" title="Transpose whole track down 1 semitone">Track &#9660; Semi</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="arrangeDivider" class="hResizer" title="Drag to resize"></div>
+
+<!-- ================= ADVANCED TRACK EDITOR (AUTOMATION) ================= -->
+<div id="advancedEditor" class="hidden">
+  <!-- ---- dock slots ----
+       A panel that normally floats elsewhere in the app (opened from its own toggle button) is MOVED
+       into one of these while the advanced editor is open, and moved back out to floating when it
+       closes — see registerDockPanel()/syncDockedPanels() in app.js (see src/ui/panels.js). A slot stays .hidden until
+       something is actually docked in it, so an empty slot contributes no width and no divider line.
+         #advDockLeft  — the chord palette (#chordPanel).
+         #advDockRight — RESERVED for the custom-sample-list panel (a later addition); it is already
+                         wired, so that panel only has to call registerDockPanel with slot:"advDockRight". -->
+  <div id="advDockLeft" class="advDock hidden"></div>
+  <div id="advTabs">
+    <button id="advCloseBtn" title="Close advanced editor">&#10005;</button>
+    <div id="advTabGrid">
+      <button data-param="volume" class="advTabBtn">Volume</button>
+      <button data-param="eqLow" class="advTabBtn">EQ Low</button>
+      <button data-param="pan" class="advTabBtn">Pan</button>
+      <button data-param="eqMid" class="advTabBtn">EQ Mid</button>
+      <button data-param="reverb" class="advTabBtn">Reverb</button>
+      <button data-param="eqHigh" class="advTabBtn">EQ High</button>
+    </div>
+  </div>
+  <div id="advLaneScroll">
+    <div id="advLaneInner">
+      <div id="advLaneHeader"></div>
+      <canvas id="advLaneCanvas"></canvas>
+      <div id="advPointLayer"></div>
+    </div>
+  </div>
+  <div id="advDockRight" class="advDock hidden"></div>
+</div>
+
+<!-- starts hidden to match #advancedEditor above: this bar resizes that panel and nothing else, so it
+     only exists while the panel does. renderAdvancedEditor() toggles the two together from then on. -->
+<div id="rollDivider" class="hidden"></div>
+
+<!-- ================= PIANO ROLL ================= -->
+<div id="rollWrap">
+  <div id="pianoCol">
+    <div id="pianoColHeaderSpacer"></div>
+    <div id="pianoColInner"></div>
+  </div>
+  <div id="gridScroll">
+    <div id="gridInner">
+      <div id="gridRuler" title="Click or drag to move the playhead"></div>
+      <canvas id="gridCanvas"></canvas>
+      <div id="noteLayer"></div>
+      <div id="selectionBox"></div>
+      <div id="playhead"></div>
+      <div id="playheadGrip"></div>
+    </div>
+  </div>
+</div>
+<div id="rollFooter">
+  <span id="footerLeft">Click a cell to add a note &middot; drag to select &middot; Ctrl+C / Ctrl+V to copy &middot; Del to remove &middot; Ctrl+Z / Ctrl+Shift+Z to undo/redo</span>
+  <div id="zoomControl"><span>Zoom</span><input type="range" id="zoomSlider" min="5" max="70" value="26"></div>
+</div>
+
+<div id="dragTooltip"></div>
+<div id="toast"></div>
+
+<!-- ================= CHORD PALETTE =================
+     Lives at body level because it has two homes: as a floating dropdown under #chordMenuBtn it must
+     escape every scrolling/overflow ancestor, and when the advanced editor is open the same element is
+     re-parented into #advDockLeft. Its grids are built once and kept across those moves — only .floating
+     vs .docked changes, so nothing here has to be torn down and rebuilt when the editor toggles. -->
+<div id="chordPanel" class="hidden">
+  <!-- three items, but only the middle one is meant to read as centred, so the head is a
+       1fr / auto / 1fr grid rather than a space-between flex row: equal side columns are what put Add
+       on the panel's true centre line regardless of how wide "Chords" or the key label happen to be.
+       Its title is rewritten by renderChordPalette() to name the chord actually selected. -->
+  <div class="chordPanelHead">
+    <span class="chordPanelTitle">Chords</span>
+    <button id="chordAddBtn" class="primary" title="Add the selected chord to the selected track">Add</button>
+    <span id="chordKeyLabel"></span>
+  </div>
+  <!-- the in-key palette leads on purpose: it is the one section that answers "what can I play right
+       now", and docked into a 165px advanced editor the panel scrolls internally — so the section that
+       must survive above the fold goes first, and the long quality grid is what you scroll down to -->
+  <div class="chordSection">
+    <div class="chordSectionLabel">In Key</div>
+    <div id="chordDiatonicGrid"></div>
+  </div>
+  <div class="chordSection">
+    <div class="chordSectionLabel">Root</div>
+    <div id="chordRootGrid"></div>
+  </div>
+  <div class="chordSection">
+    <div class="chordSectionLabel">Quality</div>
+    <div id="chordQualityGrid"></div>
+  </div>
+</div>
+
+<!-- ================= CUSTOM SAMPLE MANAGER =================
+     Same two-homed arrangement as #chordPanel above, and body-level for the same reason: floating, it
+     has to escape every scrolling ancestor to hang under #sampleMenuBtn; docked, the very same element
+     is re-parented into #advDockRight. Its rows are rebuilt by renderSamplePanel() whenever the registry
+     changes, which is independent of which home it is currently in. -->
+<div id="samplePanel" class="hidden">
+  <div class="samplePanelHead">
+    <span class="samplePanelTitle">Samples</span>
+    <span id="sampleCountLabel"></span>
+  </div>
+  <div id="sampleList"></div>
+</div>
+
+<!-- ================= TRACK COLOR PICKER ================= -->
+<div id="colorPicker" class="hidden">
+  <div id="colorPalette"></div>
+  <button id="colorCustomBtn" class="small">Custom&hellip;</button>
+  <div id="colorCustomPanel" class="hidden">
+    <div id="colorSVWrap"><canvas id="colorSVCanvas" width="140" height="90"></canvas><div id="colorSVDot"></div></div>
+    <div id="colorHueWrap"><canvas id="colorHueCanvas" width="140" height="14"></canvas><div id="colorHueDot"></div></div>
+  </div>
+</div>
+
+<!-- ================= SAVE / EXPORT MODAL ================= -->
+<div id="exportModal" class="modalOverlay hidden">
+  <div class="modalBox">
+    <h3>Save Project</h3>
+    <label class="field modalField">Title
+      <input type="text" id="exportTitleInput" maxlength="80">
+    </label>
+    <label class="field modalField">File Type
+      <select id="exportTypeSel">
+        <option value="mp3">Audio (.mp3)</option>
+        <option value="wav">Audio (.wav)</option>
+        <option value="mid">MIDI (.mid)</option>
+        <option value="json">Project (.json)</option>
+      </select>
+    </label>
+    <div class="modalField loopField">
+      <label class="checkRow"><input type="checkbox" id="exportLoopChk"><span>Repeat project</span></label>
+      <label class="field loopCountField">Times
+        <input type="number" id="exportLoopCount" min="2" max="64" value="2" disabled>
+      </label>
+    </div>
+    <div id="exportStatus" class="modalStatus"></div>
+    <div class="modalActions">
+      <button id="exportCancelBtn">Cancel</button>
+      <button id="exportConfirmBtn" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== INFO DIALOG (e.g. "looping doesn't apply to this file type") ===== -->
+<div id="infoModal" class="modalOverlay hidden">
+  <div class="modalBox">
+    <h3 id="infoTitle">Heads up</h3>
+    <div id="infoBody" class="modalStatus"></div>
+    <div class="modalActions">
+      <button id="infoOkBtn" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<script src="lamejs.min.js"></script>
+<!-- One classic <script> per module, in dependency order — deliberately NOT type="module", so the page
+     still opens by double-clicking it in Finder (file:// blocks ES module loads outright). Every file
+     wraps itself in its own IIFE and talks to the others through the single window.BitBeats namespace.
+     ORDER RULE: a file may CALL into any other (calls resolve at runtime), but may only read a plain
+     VALUE — a constant, the state object, a DOM element handle — from a file listed above it. app.js
+     stays last: it is the entry point that boots the default project. See ARCHITECTURE.md. -->
+<script src="src/core/constants.js"></script>
+<script src="src/core/state.js"></script>
+<script src="src/core/samples.js"></script>
+<script src="src/core/history.js"></script>
+<script src="src/audio/engine.js"></script>
+<script src="src/audio/automation.js"></script>
+<script src="src/ui/piano-roll.js"></script>
+<script src="src/audio/transport.js"></script>
+<script src="src/ui/track-list.js"></script>
+<script src="src/ui/advanced-editor.js"></script>
+<script src="src/ui/inst-editor.js"></script>
+<script src="src/ui/note-editing.js"></script>
+<script src="src/ui/loop-zoom.js"></script>
+<script src="src/ui/instrument-list-events.js"></script>
+<script src="src/ui/header-controls.js"></script>
+<script src="src/io/persistence.js"></script>
+<script src="src/ui/panels.js"></script>
+<script src="src/ui/resizers.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
